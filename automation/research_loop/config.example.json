@@ -1,0 +1,25 @@
+{
+  "goal": "Improve project quality using academically defensible, measurable changes.",
+  "headline_metric": "primary_score",
+  "target_value": null,
+  "max_cycles": 5,
+  "stop_conditions": {
+    "max_consecutive_inconclusive_cycles": 2,
+    "max_consecutive_stagnant_cycles": 2,
+    "max_consecutive_regressions": 1
+  },
+  "claude": {
+    "model": "opus",
+    "effort": "medium"
+  },
+  "codex": {
+    "model": "gpt-5.4",
+    "sandbox": "workspace-write",
+    "dangerously_bypass_approvals_and_sandbox": false
+  },
+  "paths": {
+    "current_cycle_markdown": "CURRENT_CYCLE.md",
+    "state_json": "results/research_loop/state.json",
+    "cycles_dir": "results/research_loop/cycles"
+  }
+}

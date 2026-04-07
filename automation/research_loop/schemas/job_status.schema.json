@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "status",
+    "exit_code",
+    "duration_seconds",
+    "output_path",
+    "log_path",
+    "started_at_utc",
+    "finished_at_utc"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["completed", "failed", "stalled", "timed_out"]
+    },
+    "exit_code": {
+      "type": ["integer", "null"]
+    },
+    "duration_seconds": {
+      "type": ["number", "null"]
+    },
+    "output_path": {
+      "type": ["string", "null"]
+    },
+    "log_path": {
+      "type": ["string", "null"]
+    },
+    "started_at_utc": {
+      "type": "string"
+    },
+    "finished_at_utc": {
+      "type": "string"
+    }
+  }
+}

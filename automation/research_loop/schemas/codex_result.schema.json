@@ -1,0 +1,99 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "summary",
+    "headline_metric",
+    "headline_value",
+    "baseline_value",
+    "delta",
+    "files_changed",
+    "artifacts",
+    "recommendation",
+    "next_focus",
+    "doc_updates",
+    "tests_or_commands",
+    "notes_for_claude"
+  ],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "validated",
+        "inconclusive",
+        "rejected",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "headline_metric": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "headline_value": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "baseline_value": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "delta": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "recommendation": {
+      "type": "string",
+      "enum": [
+        "continue",
+        "pivot",
+        "stop"
+      ]
+    },
+    "next_focus": {
+      "type": "string"
+    },
+    "doc_updates": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tests_or_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes_for_claude": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
+

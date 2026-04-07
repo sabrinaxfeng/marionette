@@ -1,0 +1,83 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "objective",
+    "failure_bucket",
+    "hypothesis",
+    "academic_rationale",
+    "smallest_valid_experiment",
+    "evaluation_plan",
+    "acceptance_gate",
+    "non_goals",
+    "risks",
+    "notes_for_codex",
+    "stop_reason",
+    "files_to_consult"
+  ],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": [
+        "continue",
+        "stop"
+      ]
+    },
+    "objective": {
+      "type": "string"
+    },
+    "failure_bucket": {
+      "type": "string"
+    },
+    "hypothesis": {
+      "type": "string"
+    },
+    "academic_rationale": {
+      "type": "string"
+    },
+    "smallest_valid_experiment": {
+      "type": "string"
+    },
+    "evaluation_plan": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acceptance_gate": {
+      "type": "string"
+    },
+    "non_goals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes_for_codex": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "stop_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "files_to_consult": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
+

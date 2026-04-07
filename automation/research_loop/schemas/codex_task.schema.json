@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "objective",
+    "hypothesis",
+    "instructions",
+    "validation_command",
+    "files_to_read",
+    "acceptance_gate",
+    "timeout_minutes",
+    "source"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Unique task identifier, e.g. cycle-003-task-01"
+    },
+    "objective": {
+      "type": "string",
+      "description": "What this task should accomplish"
+    },
+    "hypothesis": {
+      "type": "string",
+      "description": "The testable claim this experiment validates"
+    },
+    "instructions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered steps for Codex to execute"
+    },
+    "validation_command": {
+      "type": ["string", "null"],
+      "description": "Shell command Codex should run after implementation to self-check"
+    },
+    "files_to_read": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Files Codex should read for context before starting"
+    },
+    "acceptance_gate": {
+      "type": "string",
+      "description": "Criterion that determines pass/fail"
+    },
+    "timeout_minutes": {
+      "type": "integer",
+      "description": "Max wall-clock time before watcher kills the job"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["claude", "codex_analyst"],
+      "description": "Who created this task"
+    }
+  }
+}
