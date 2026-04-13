@@ -3,6 +3,7 @@
   "additionalProperties": false,
   "required": [
     "task_id",
+    "graph_id",
     "objective",
     "hypothesis",
     "instructions",
@@ -10,12 +11,26 @@
     "files_to_read",
     "acceptance_gate",
     "timeout_minutes",
-    "source"
+    "source",
+    "depends_on",
+    "conflict_keys"
   ],
   "properties": {
     "task_id": {
       "type": "string",
       "description": "Unique task identifier, e.g. cycle-003-task-01"
+    },
+    "graph_id": {
+      "type": "string",
+      "description": "Dependency-graph identifier shared by all tasks in one task frame"
+    },
+    "task_group_id": {
+      "type": "string",
+      "description": "Research-management grouping for related tasks. Defaults to graph_id if omitted."
+    },
+    "task_group_title": {
+      "type": "string",
+      "description": "Human-readable title for the task group. Used for synthesis/status reporting."
     },
     "objective": {
       "type": "string",
@@ -45,7 +60,26 @@
     },
     "timeout_minutes": {
       "type": "integer",
-      "description": "Max wall-clock time before watcher kills the job"
+      "description": "Max wall-clock time before watcher kills the job. Choose per task; do not treat 60 minutes as a universal default."
+    },
+    "depends_on": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Task IDs that must complete successfully before this task can run"
+    },
+    "conflict_keys": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Write-domain locks; tasks sharing a conflict key are serialized"
+    },
+    "priority": {
+      "type": "integer",
+      "description": "Higher priority tasks are dispatched first when multiple are runnable"
+    },
+    "analyst_reasoning_effort": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "xhigh"],
+      "description": "Reasoning effort for the analyst. Default to medium; reserve xhigh for unusually hard coordination, debugging, or synthesis."
     },
     "source": {
       "type": "string",

@@ -1,6 +1,6 @@
 ---
 name: research-loop
-description: Run a Claude-Codex autonomous research loop. Claude sets large task frames, the Codex analyst autonomously implements via subagents and self-iterates until done, then hands back to Claude.
+description: Run a Claude-Codex autonomous research loop. Claude sets large task frames, the Codex analyst autonomously implements via subagents and self-iterates until done, then hands back to Claude. Use to start, resume, or inspect the loop.
 argument-hint: [--auto N] [--resume] [--status]
 ---
 
@@ -11,15 +11,15 @@ You are Claude, the research director. You set large task frames and the analyst
 ## Architecture
 
 ```
-Claude (you)  →  Analyst (Codex, high reasoning)  →  [self-iterates via mini subagents]  →  Claude
+Claude (you)  →  Analyst (Codex, variable effort)  →  [self-iterates via mini subagents]  →  Claude
                       ↑                                    |
-                      └── next_task (silent loop) ─────────┘
+                      └── next_task / next_tasks DAG (silent loop) ─────────┘
 ```
 
 - **You**: set research direction, write large task frames, review final results
-- **Analyst** (Codex, high reasoning): the autonomous executor. Reads the task, plans the breakdown, spawns coding subagents for implementation/eval/diagnostics, reviews their output, queues follow-up tasks, and self-iterates until the task frame is complete.
+- **Analyst** (Codex, usually `medium` effort): the autonomous executor. Reads the task, plans the breakdown, spawns coding subagents for implementation/eval/diagnostics, reviews their output, queues follow-up tasks, and self-iterates until the task frame is complete.
 - **Watcher**: dumb PID/log/timeout monitor on the analyst process
-- **Glue script**: manages the queue. If analyst has a next_task, silently chains to the next cycle (you are NOT notified). Only notifies you when the task frame is done or the analyst escalates.
+- **Glue script + dispatcher**: manages the queue. If the analyst emits `next_task` or `next_tasks`, they are queued into a dependency graph and any runnable tasks are launched silently up to the configured parallelism cap. You are only notified when the task frame is done, blocked, or the analyst escalates.
 
 **You are only resumed when:**
 1. The analyst completes the whole task frame (no next_task)
@@ -52,6 +52,8 @@ Read these files:
 - `automation/research_loop/config.json` — goal, limits, stop conditions
 - `results/research_loop/state.json` — loop state (if exists)
 - `results/research_loop/queue/` — pending/running/completed/failed jobs
+- `python3 automation/research_loop/graph_summary.py` — graph-level status, including stale graphs
+- `python3 automation/research_loop/task_group_summary.py` — task-group status, including groups ready for synthesis
 - Your tracker document (e.g. `IMPROVEMENTS.md`) — the shared world model that grounds all planning
 
 ### 2. If --status, report and stop
@@ -66,7 +68,16 @@ Write a `codex_task.json`:
 - **hypothesis**: what we expect to validate
 - **instructions**: high-level steps — the analyst will expand these
 - **acceptance_gate**: what "done" looks like for the whole section
-- **timeout_minutes**: generous — the analyst may self-iterate through multiple sub-steps
+- **timeout_minutes**: set this deliberately for the task instead of defaulting to one fixed number
+  - use shorter limits for bounded diagnostics, schema/docs edits, or small eval slices
+  - use longer limits for benchmark runs, multi-step implementation+eval loops, or tasks likely to fan out through several analyst sub-steps
+  - 60 minutes is not a default; it is only appropriate when the task genuinely needs that long
+- **graph_id**: stable ID for this task frame
+- **task_group_id**: research-management group for related tasks; reuse it across one investigative thread
+- **task_group_title**: short human-readable label for the investigative thread
+- **depends_on**: `[]` for the root task
+- **conflict_keys**: write-surface locks, e.g. `["src", "docs"]`
+- **analyst_reasoning_effort**: choose `medium` by default; use `high` for non-trivial synthesis/debugging; use `xhigh` only when clearly necessary
 
 ### 4. Dispatch
 
@@ -94,10 +105,44 @@ Save the session bridge before dispatching (with `mode: "interactive"`) so the g
 
 When resumed:
 - Read the chain of completed jobs in `queue/completed/` (there may be several from self-iteration)
+- Read sibling branches too when a graph fan-outs into parallel tasks
 - Review the final `analysis.json`
 - Check what files changed, what metrics moved
 - Update `state.json` and `CURRENT_CYCLE.md`
 - Decide: launch the next task frame, or stop
+
+### 5a. Dependency graph rules
+
+When reviewing or launching work, treat the queue as a DAG:
+
+- Tasks in one frame share a `graph_id`
+- Related investigative branches may also share a `task_group_id`
+- `depends_on` controls when a task becomes runnable
+- `conflict_keys` serialize tasks that should not edit the same surface at once
+- The dispatcher launches any runnable task up to `max_parallel_jobs`
+- Use `python3 automation/research_loop/task_group_summary.py` to see which groups are active, blocked, or ready for synthesis
+- Use `python3 automation/research_loop/graph_summary.py` to inspect graph-level status, especially for blocked/failed/stale graphs
+- Use `python3 automation/research_loop/check_stale_graphs.py --dry-run` if the queue feels quiet and you want to see whether anything has gone stale enough to require review
+
+When you instruct the analyst, tell it explicitly:
+
+- emit `next_tasks` when downstream branches are independent
+- reuse the same `graph_id` across the frame
+- reuse the same `task_group_id` for tasks that belong to one research question, even if they fan out across multiple graphs later
+- use conservative `conflict_keys` for overlapping code/docs/eval artifacts
+- if overlap is uncertain, choose broader conflict keys and serialize rather than assuming branches are safe
+- reasonable broad keys include `code`, `docs`, `eval:webqsp`, `eval:benchmark`, or a feature/bucket-level key like `grounding`
+- choose `timeout_minutes` intentionally:
+  - keep bounded diagnostics tight
+  - extend time for full benchmark runs or multi-step tasks
+  - do not mechanically assign `60`; match the limit to the expected wall-clock need plus some safety margin
+- choose `analyst_reasoning_effort` intentionally:
+  - default: `medium`
+  - escalate to `high` only for genuinely hard coordination or failure analysis
+  - reserve `xhigh` for rare cases where lower effort is unlikely to be enough
+- if unsure whether branches are independent, serialize them instead
+- parallelize launch according to the DAG whenever branches are independent and conflict keys do not overlap
+- own join/synthesis behavior yourself: when a task group becomes `ready_for_synthesis`, review the whole group and decide whether to add more tasks or mark the group complete
 
 ### 6. Stop conditions
 

@@ -12,6 +12,7 @@
     "summary",
     "diagnosis",
     "next_task",
+    "next_tasks",
     "files_changed",
     "escalation_reason"
   ],
@@ -53,9 +54,12 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["task_id", "objective", "hypothesis", "instructions", "validation_command", "files_to_read", "acceptance_gate", "timeout_minutes", "source"],
+          "required": ["task_id", "graph_id", "task_group_id", "task_group_title", "objective", "hypothesis", "instructions", "validation_command", "files_to_read", "acceptance_gate", "timeout_minutes", "source", "depends_on", "conflict_keys", "priority", "analyst_reasoning_effort"],
           "properties": {
             "task_id": {"type": "string"},
+            "graph_id": {"type": "string"},
+            "task_group_id": {"type": "string"},
+            "task_group_title": {"type": "string"},
             "objective": {"type": "string"},
             "hypothesis": {"type": "string"},
             "instructions": {"type": "array", "items": {"type": "string"}},
@@ -63,11 +67,42 @@
             "files_to_read": {"type": "array", "items": {"type": "string"}},
             "acceptance_gate": {"type": "string"},
             "timeout_minutes": {"type": "integer"},
+            "depends_on": {"type": "array", "items": {"type": "string"}},
+            "conflict_keys": {"type": "array", "items": {"type": "string"}},
+            "priority": {"type": "integer"},
+            "analyst_reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]},
             "source": {"type": "string", "enum": ["claude", "codex_analyst"]}
           }
         }
       ],
       "description": "If decision is accept/rerun/diagnose, the next codex_task to queue (conforms to codex_task schema)"
+    },
+    "next_tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["task_id", "graph_id", "task_group_id", "task_group_title", "objective", "hypothesis", "instructions", "validation_command", "files_to_read", "acceptance_gate", "timeout_minutes", "source", "depends_on", "conflict_keys", "priority", "analyst_reasoning_effort"],
+        "properties": {
+          "task_id": {"type": "string"},
+          "graph_id": {"type": "string"},
+          "task_group_id": {"type": "string"},
+          "task_group_title": {"type": "string"},
+          "objective": {"type": "string"},
+          "hypothesis": {"type": "string"},
+          "instructions": {"type": "array", "items": {"type": "string"}},
+          "validation_command": {"type": ["string", "null"]},
+          "files_to_read": {"type": "array", "items": {"type": "string"}},
+          "acceptance_gate": {"type": "string"},
+          "timeout_minutes": {"type": "integer"},
+          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "conflict_keys": {"type": "array", "items": {"type": "string"}},
+          "priority": {"type": "integer"},
+          "analyst_reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]},
+          "source": {"type": "string", "enum": ["claude", "codex_analyst"]}
+        }
+      },
+      "description": "Parallelizable follow-up tasks in the same dependency graph"
     },
     "files_changed": {
       "type": "array",

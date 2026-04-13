@@ -160,7 +160,10 @@ Claude (director)  -->  Analyst (Codex, high reasoning)  -->  Workers (codex-min
 ## Key Design Decisions
 
 - **File-backed queue** (`pending/` -> `running/` -> `completed/` | `failed/`) — no database, no daemon, fully inspectable.
-- **Analyst self-iteration** — the glue script silently chains `next_task` without notifying Claude. This keeps Claude's context window free for high-level direction.
+- **Analyst self-iteration** — the glue script silently chains `next_task` / `next_tasks` without notifying Claude. This keeps Claude's context window free for high-level direction.
+- **Dependency graph + conflict keys** — tasks can fan out into parallel branches via `depends_on`, while `conflict_keys` serialize branches that touch the same write surface.
+- **Task groups over graphs** — DAGs handle execution order; `task_group_id` lets Claude synthesize several related tasks as one research thread.
+- **Operational visibility** — graph summaries, task-group summaries, stale-graph detection, and a local dashboard make the queue inspectable without reading raw JSON by hand.
 - **Structured output contracts** — JSON schemas for tasks, results, and job status ensure the analyst's output is machine-parseable.
 - **Review signals** — the analyst can pause itself and write `REVIEW_REQUESTED.json` to escalate to Claude on architectural decisions or ambiguities.
 - **Dual-mode session bridge** — works from both interactive chat and CLI (`claude -p`). In interactive mode, the watcher+glue chain runs via `run_in_background` and results flow back as a background notification to the active session. In CLI mode, the glue script calls `claude --resume` to spawn a continuation. `claude_session.json` records the mode so the glue script knows which path to take.
@@ -172,7 +175,13 @@ Claude (director)  -->  Analyst (Codex, high reasoning)  -->  Workers (codex-min
 automation/research_loop/
   job_watcher.py          # Launches analyst, monitors PID, enforces timeout
   run_post_job.sh         # Glue: reads analysis.json, chains next_task or resumes Claude
+  dispatch_ready_tasks.py # Scheduler: launches runnable DAG nodes up to max_parallel_jobs
   status.sh               # Quick status check for running jobs + queue counts
+  graph_summary.py        # Graph-level summaries, including stale detection
+  task_group_summary.py   # Task-group rollups for synthesis handoffs
+  check_stale_graphs.py   # Escalates stale graphs back to Claude
+  dashboard.py            # Local read-only dashboard server
+  dashboard_static/       # Dashboard HTML/CSS/JS assets
   config.example.json     # Template configuration
   schemas/
     codex_task.schema.json       # Task contract
@@ -242,6 +251,8 @@ Edit `automation/research_loop/config.json`:
   "headline_metric": "primary_score",
   "target_value": 0.85,
   "max_cycles": 5,
+  "max_parallel_jobs": 2,
+  "stale_graph_minutes": 120,
   "stop_conditions": {
     "max_consecutive_inconclusive_cycles": 2,
     "max_consecutive_stagnant_cycles": 2,
@@ -300,6 +311,10 @@ bash automation/research_loop/run_post_job.sh \
 
 ```bash
 bash automation/research_loop/status.sh
+python3 automation/research_loop/graph_summary.py
+python3 automation/research_loop/task_group_summary.py
+python3 automation/research_loop/check_stale_graphs.py --dry-run
+python3 automation/research_loop/dashboard.py --port 8765
 ```
 
 ## How the Loop Works
@@ -310,11 +325,11 @@ bash automation/research_loop/status.sh
 
 2. **Watcher** (`job_watcher.py`) launches the Codex analyst process, monitors its PID, writes heartbeats, and enforces the timeout.
 
-3. **Analyst** (Codex at high reasoning) reads the task, breaks it down, and spawns coding subagents (`codex-mini`) for implementation and evaluation. It writes `analysis.json` with its decision (`accept`/`reject`/`escalate`) and optionally a `next_task`.
+3. **Analyst** (Codex with task-chosen reasoning effort) reads the task, breaks it down, and spawns coding subagents (`codex-mini`) for implementation and evaluation. It writes `analysis.json` with its decision (`accept`/`reject`/`escalate`) and optionally `next_task` or `next_tasks`.
 
 4. **Glue** (`run_post_job.sh`) reads `analysis.json`:
-   - If `next_task` exists: silently writes it to `pending/`, claims it, and launches a new watcher cycle. **Claude is not notified.**
-   - If no `next_task` or escalation: moves the job to `completed/` and resumes Claude via the session bridge.
+   - If `next_task` / `next_tasks` exist: silently writes them to `pending/`, dispatches any runnable branches, and keeps Claude asleep while the graph is still active.
+   - If a graph blocks/fails, or a task group reaches `ready_for_synthesis`: resumes Claude via the session bridge.
 
 5. **Claude** reviews the chain of completed jobs, updates the tracker doc with results and new status, and decides whether to launch another task frame or stop. 
 
@@ -324,8 +339,8 @@ All inter-agent communication uses JSON schemas in `automation/research_loop/sch
 
 | Schema | Purpose |
 |--------|---------|
-| `codex_task.schema.json` | Task contract: what to do, how to validate |
-| `codex_post_run.schema.json` | Analyst output: decision, metrics, next_task |
+| `codex_task.schema.json` | Task contract: what to do, how to validate, which graph/task group it belongs to |
+| `codex_post_run.schema.json` | Analyst output: decision, metrics, next_task / next_tasks |
 | `job_status.schema.json` | Watcher output: exit code, duration, paths |
 | `codex_result.schema.json` | Cycle result for state tracking |
 | `claude_plan.schema.json` | Claude's planning output |

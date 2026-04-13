@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Research Loop Dashboard</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Marionette</p>
+          <h1>Research Loop Dashboard</h1>
+          <p class="hero-copy" id="goal">Loading goal…</p>
+        </div>
+        <div class="hero-actions">
+          <button id="refreshButton" class="button">Refresh</button>
+          <span class="stamp" id="generatedAt">Waiting for data…</span>
+        </div>
+      </header>
+
+      <section class="stats" id="stats"></section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Loop</h2>
+            <span class="badge" id="loopStatus">unknown</span>
+          </div>
+          <dl class="meta" id="loopMeta"></dl>
+          <div class="message-box">
+            <h3>Latest Completion</h3>
+            <pre id="latestCompletion">No completion message yet.</pre>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Session</h2>
+            <span class="badge" id="sessionMode">none</span>
+          </div>
+          <dl class="meta" id="sessionMeta"></dl>
+        </article>
+      </section>
+
+      <section class="grid two-up">
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Graphs</h2>
+            <span class="subtle" id="graphCount">0</span>
+          </div>
+          <div id="graphs" class="stack"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Task Groups</h2>
+            <span class="subtle" id="groupCount">0</span>
+          </div>
+          <div id="taskGroups" class="stack"></div>
+        </article>
+      </section>
+
+      <section class="grid two-up">
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Runnable Pending</h2>
+            <span class="subtle" id="runnableCount">0</span>
+          </div>
+          <div id="runnablePending" class="stack compact"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Blocked Pending</h2>
+            <span class="subtle" id="blockedCount">0</span>
+          </div>
+          <div id="blockedPending" class="stack compact"></div>
+        </article>
+      </section>
+
+      <section class="panel jobs-panel">
+        <div class="panel-header">
+          <h2>Jobs</h2>
+          <span class="subtle" id="jobCount">0</span>
+        </div>
+        <div id="jobs" class="stack"></div>
+      </section>
+
+      <section class="panel viewer-panel">
+        <div class="panel-header">
+          <h2>Artifact Viewer</h2>
+          <span class="subtle" id="artifactLabel">Choose a job artifact</span>
+        </div>
+        <div class="artifact-actions">
+          <button class="button muted" data-kind="stdout">stdout</button>
+          <button class="button muted" data-kind="stderr">stderr</button>
+          <button class="button muted" data-kind="analysis">analysis</button>
+          <button class="button muted" data-kind="task">task</button>
+          <button class="button muted" data-kind="status">status</button>
+          <button class="button muted" data-kind="heartbeat">heartbeat</button>
+        </div>
+        <pre id="artifactViewer">Select an artifact from the Jobs section.</pre>
+      </section>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

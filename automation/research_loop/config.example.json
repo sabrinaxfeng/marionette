@@ -3,6 +3,8 @@
   "headline_metric": "primary_score",
   "target_value": null,
   "max_cycles": 5,
+  "max_parallel_jobs": 2,
+  "stale_graph_minutes": 120,
   "stop_conditions": {
     "max_consecutive_inconclusive_cycles": 2,
     "max_consecutive_stagnant_cycles": 2,
@@ -14,6 +16,7 @@
   },
   "codex": {
     "model": "gpt-5.4",
+    "reasoning_effort": "medium",
     "sandbox": "workspace-write",
     "dangerously_bypass_approvals_and_sandbox": false
   },

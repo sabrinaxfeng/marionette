@@ -44,10 +44,13 @@ def load_config(path: Path, root: Path) -> dict[str, Any]:
     claude_defaults = {"model": "opus", "effort": "medium"}
     codex_defaults = {
         "model": "gpt-5.4",
+        "reasoning_effort": "medium",
         "sandbox": "workspace-write",
         "dangerously_bypass_approvals_and_sandbox": False,
     }
     data.setdefault("max_cycles", 3)
+    data.setdefault("max_parallel_jobs", 1)
+    data.setdefault("stale_graph_minutes", 120)
     data.setdefault("headline_metric", "primary_score")
     data.setdefault("target_value", None)
     data["stop_conditions"] = {**stop_defaults, **data.get("stop_conditions", {})}
@@ -258,14 +261,308 @@ def _load_task_schema() -> dict[str, Any] | None:
     return None
 
 
+def normalize_task(task: dict[str, Any], *, parent_task: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = dict(task)
+    parent_graph_id = parent_task.get("graph_id") if parent_task else None
+    parent_task_id = parent_task.get("task_id") if parent_task else None
+    parent_group_id = parent_task.get("task_group_id") if parent_task else None
+    parent_group_title = parent_task.get("task_group_title") if parent_task else None
+
+    normalized["graph_id"] = normalized.get("graph_id") or parent_graph_id or normalized["task_id"]
+    depends_on = list(normalized.get("depends_on") or [])
+    if parent_task_id and parent_task_id not in depends_on:
+        depends_on.insert(0, parent_task_id)
+    normalized["depends_on"] = list(dict.fromkeys(depends_on))
+    normalized["conflict_keys"] = list(dict.fromkeys(normalized.get("conflict_keys") or []))
+    normalized["priority"] = int(normalized.get("priority", 0) or 0)
+    normalized["task_group_id"] = normalized.get("task_group_id") or parent_group_id or normalized["graph_id"]
+    normalized["task_group_title"] = normalized.get("task_group_title") or parent_group_title or normalized["objective"]
+    return normalized
+
+
+def task_graph_id(task: dict[str, Any]) -> str:
+    return normalize_task(task)["graph_id"]
+
+
+def task_dependency_ids(task: dict[str, Any]) -> list[str]:
+    return normalize_task(task)["depends_on"]
+
+
+def task_conflict_keys(task: dict[str, Any]) -> list[str]:
+    return normalize_task(task)["conflict_keys"]
+
+
+def task_group_id(task: dict[str, Any]) -> str:
+    return normalize_task(task)["task_group_id"]
+
+
+def task_group_title(task: dict[str, Any]) -> str:
+    return normalize_task(task)["task_group_title"]
+
+
+def _iter_queue_task_paths(config: dict[str, Any], queue_name: str) -> list[Path]:
+    dirs = queue_dirs(config)
+    queue_dir = dirs[queue_name]
+    if queue_name == "pending":
+        return sorted(queue_dir.glob("*.json"))
+    return sorted(path for path in queue_dir.glob("*/task.json") if path.is_file())
+
+
+def load_tasks(config: dict[str, Any], queue_name: str) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for path in _iter_queue_task_paths(config, queue_name):
+        task = normalize_task(load_json(path))
+        task["_queue"] = queue_name
+        task["_path"] = str(path)
+        tasks.append(task)
+    return tasks
+
+
+def locate_task(config: dict[str, Any], task_id: str) -> tuple[str, Path] | None:
+    for queue_name in ("pending", "running", "completed", "failed"):
+        for task in load_tasks(config, queue_name):
+            if task["task_id"] == task_id:
+                return queue_name, Path(task["_path"])
+    return None
+
+
+def queue_task_counts(config: dict[str, Any]) -> dict[str, int]:
+    return {queue_name: len(load_tasks(config, queue_name)) for queue_name in ("pending", "running", "completed", "failed")}
+
+
+def completed_task_ids(config: dict[str, Any]) -> set[str]:
+    return {task["task_id"] for task in load_tasks(config, "completed")}
+
+
+def failed_task_ids(config: dict[str, Any]) -> set[str]:
+    return {task["task_id"] for task in load_tasks(config, "failed")}
+
+
+def running_tasks(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return load_tasks(config, "running")
+
+
+def active_conflict_keys(config: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for task in running_tasks(config):
+        keys.update(task_conflict_keys(task))
+    return keys
+
+
+def task_block_reason(
+    task: dict[str, Any],
+    *,
+    completed_ids: set[str],
+    failed_ids: set[str],
+    running_conflicts: set[str],
+) -> str | None:
+    failed_dependencies = [dep for dep in task_dependency_ids(task) if dep in failed_ids]
+    if failed_dependencies:
+        return f"failed_dependencies:{','.join(sorted(failed_dependencies))}"
+    missing_dependencies = [dep for dep in task_dependency_ids(task) if dep not in completed_ids]
+    if missing_dependencies:
+        return f"waiting_on:{','.join(sorted(missing_dependencies))}"
+    conflicting_keys = sorted(set(task_conflict_keys(task)) & running_conflicts)
+    if conflicting_keys:
+        return f"conflicts_with_running:{','.join(conflicting_keys)}"
+    return None
+
+
+def runnable_pending_tasks(config: dict[str, Any], *, graph_id: str | None = None) -> list[dict[str, Any]]:
+    completed_ids = completed_task_ids(config)
+    failed_ids = failed_task_ids(config)
+    running_conflicts = active_conflict_keys(config)
+    tasks = load_tasks(config, "pending")
+    runnable: list[dict[str, Any]] = []
+    for task in tasks:
+        if graph_id and task_graph_id(task) != graph_id:
+            continue
+        if task_block_reason(task, completed_ids=completed_ids, failed_ids=failed_ids, running_conflicts=running_conflicts) is None:
+            runnable.append(task)
+    return sorted(runnable, key=lambda task: (-int(task.get("priority", 0)), task["task_id"]))
+
+
+def blocked_pending_tasks(config: dict[str, Any], *, graph_id: str | None = None) -> list[dict[str, Any]]:
+    completed_ids = completed_task_ids(config)
+    failed_ids = failed_task_ids(config)
+    running_conflicts = active_conflict_keys(config)
+    blocked: list[dict[str, Any]] = []
+    for task in load_tasks(config, "pending"):
+        if graph_id and task_graph_id(task) != graph_id:
+            continue
+        reason = task_block_reason(task, completed_ids=completed_ids, failed_ids=failed_ids, running_conflicts=running_conflicts)
+        if reason is None:
+            continue
+        blocked.append({**task, "_block_reason": reason})
+    return sorted(blocked, key=lambda task: (-int(task.get("priority", 0)), task["task_id"]))
+
+
+def graph_snapshot(config: dict[str, Any], graph_id: str) -> dict[str, Any]:
+    running = [task["task_id"] for task in running_tasks(config) if task_graph_id(task) == graph_id]
+    completed = [task["task_id"] for task in load_tasks(config, "completed") if task_graph_id(task) == graph_id]
+    failed = [task["task_id"] for task in load_tasks(config, "failed") if task_graph_id(task) == graph_id]
+    runnable = [task["task_id"] for task in runnable_pending_tasks(config, graph_id=graph_id)]
+    blocked = [
+        {"task_id": task["task_id"], "reason": task["_block_reason"]}
+        for task in blocked_pending_tasks(config, graph_id=graph_id)
+    ]
+    return {
+        "graph_id": graph_id,
+        "running": running,
+        "completed": completed,
+        "failed": failed,
+        "runnable_pending": runnable,
+        "blocked_pending": blocked,
+    }
+
+
+def _task_artifact_paths(task: dict[str, Any]) -> list[Path]:
+    task_path = Path(task["_path"])
+    if task["_queue"] == "pending":
+        return [task_path]
+    job_dir = task_path.parent
+    return [path for path in job_dir.rglob("*") if path.is_file()]
+
+
+def _path_timestamp(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def graph_last_updated_epoch(config: dict[str, Any], graph_id: str) -> float | None:
+    timestamps: list[float] = []
+    for queue_name in ("pending", "running", "completed", "failed"):
+        for task in load_tasks(config, queue_name):
+            if task_graph_id(task) != graph_id:
+                continue
+            timestamps.extend(_path_timestamp(path) for path in _task_artifact_paths(task))
+    return max(timestamps) if timestamps else None
+
+
+def graph_summary(config: dict[str, Any], graph_id: str, *, stale_after_minutes: int | None = None) -> dict[str, Any]:
+    snapshot = graph_snapshot(config, graph_id)
+    tasks = [
+        task
+        for queue_name in ("pending", "running", "completed", "failed")
+        for task in load_tasks(config, queue_name)
+        if task_graph_id(task) == graph_id
+    ]
+    task_groups = sorted({task_group_id(task) for task in tasks})
+    last_updated_epoch = graph_last_updated_epoch(config, graph_id)
+    age_minutes = None
+    if last_updated_epoch is not None:
+        age_minutes = max(0.0, (datetime.now(timezone.utc).timestamp() - last_updated_epoch) / 60.0)
+
+    if snapshot["running"] or snapshot["runnable_pending"]:
+        status = "active"
+    elif snapshot["blocked_pending"]:
+        status = "blocked"
+    elif snapshot["failed"]:
+        status = "failed"
+    elif snapshot["completed"]:
+        status = "ready_for_review"
+    else:
+        status = "empty"
+
+    stale = bool(
+        stale_after_minutes is not None
+        and age_minutes is not None
+        and age_minutes >= stale_after_minutes
+        and not snapshot["running"]
+        and not snapshot["runnable_pending"]
+        and status in {"blocked", "failed", "ready_for_review"}
+    )
+
+    return {
+        **snapshot,
+        "status": status,
+        "task_group_ids": task_groups,
+        "last_updated_epoch": last_updated_epoch,
+        "last_updated_utc": (
+            datetime.fromtimestamp(last_updated_epoch, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if last_updated_epoch is not None else None
+        ),
+        "age_minutes": None if age_minutes is None else round(age_minutes, 1),
+        "stale": stale,
+    }
+
+
+def graph_summaries(config: dict[str, Any], *, stale_after_minutes: int | None = None) -> list[dict[str, Any]]:
+    graph_ids = {
+        task_graph_id(task)
+        for queue_name in ("pending", "running", "completed", "failed")
+        for task in load_tasks(config, queue_name)
+    }
+    status_rank = {"active": 0, "blocked": 1, "failed": 2, "ready_for_review": 3, "empty": 4}
+    summaries = [graph_summary(config, graph_id, stale_after_minutes=stale_after_minutes) for graph_id in sorted(graph_ids)]
+    return sorted(summaries, key=lambda item: (status_rank.get(item["status"], 99), item["graph_id"]))
+
+
+def stale_graph_summaries(config: dict[str, Any], *, stale_after_minutes: int | None = None) -> list[dict[str, Any]]:
+    threshold = stale_after_minutes if stale_after_minutes is not None else int(config.get("stale_graph_minutes", 120) or 120)
+    return [summary for summary in graph_summaries(config, stale_after_minutes=threshold) if summary["stale"]]
+
+
+def task_group_snapshot(config: dict[str, Any], task_group_id_value: str) -> dict[str, Any]:
+    running = [task for task in running_tasks(config) if task_group_id(task) == task_group_id_value]
+    completed = [task for task in load_tasks(config, "completed") if task_group_id(task) == task_group_id_value]
+    failed = [task for task in load_tasks(config, "failed") if task_group_id(task) == task_group_id_value]
+    runnable = [task for task in runnable_pending_tasks(config) if task_group_id(task) == task_group_id_value]
+    blocked = [task for task in blocked_pending_tasks(config) if task_group_id(task) == task_group_id_value]
+    all_tasks = running + completed + failed + runnable + blocked
+    graphs = sorted({task_graph_id(task) for task in all_tasks})
+    title = task_group_title(all_tasks[0]) if all_tasks else task_group_id_value
+
+    if running or runnable:
+        status = "active"
+    elif failed or blocked:
+        status = "blocked"
+    elif completed:
+        status = "ready_for_synthesis"
+    else:
+        status = "empty"
+
+    return {
+        "task_group_id": task_group_id_value,
+        "task_group_title": title,
+        "status": status,
+        "graph_ids": graphs,
+        "running": [task["task_id"] for task in running],
+        "completed": [task["task_id"] for task in completed],
+        "failed": [task["task_id"] for task in failed],
+        "runnable_pending": [task["task_id"] for task in runnable],
+        "blocked_pending": [
+            {"task_id": task["task_id"], "reason": task["_block_reason"]}
+            for task in blocked
+        ],
+    }
+
+
+def task_group_summaries(config: dict[str, Any]) -> list[dict[str, Any]]:
+    task_groups = {
+        task_group_id(task)
+        for queue_name in ("pending", "running", "completed", "failed")
+        for task in load_tasks(config, queue_name)
+    }
+    summaries = [task_group_snapshot(config, group_id) for group_id in sorted(task_groups)]
+    status_rank = {"active": 0, "blocked": 1, "ready_for_synthesis": 2, "empty": 3}
+    return sorted(summaries, key=lambda item: (status_rank.get(item["status"], 99), item["task_group_id"]))
+
+
 def write_task(config: dict[str, Any], task: dict[str, Any]) -> Path:
     """Validate and write a task to queue/pending/. Returns the file path."""
+    task = normalize_task(task)
     schema = _load_task_schema()
     if schema:
         required = schema.get("required", [])
         missing = [k for k in required if k not in task]
         if missing:
             raise ValueError(f"Task missing required fields: {missing}")
+    existing = locate_task(config, task["task_id"])
+    if existing is not None:
+        raise ValueError(f"Task ID already exists in queue: {task['task_id']}")
     dirs = queue_dirs(config)
     task_id = task["task_id"]
     path = dirs["pending"] / f"{task_id}.json"
@@ -277,6 +574,8 @@ def claim_task(config: dict[str, Any], task_id: str) -> Path:
     """Move task from pending/ to running/{task_id}/, return the job directory."""
     dirs = queue_dirs(config)
     src = dirs["pending"] / f"{task_id}.json"
+    if not src.exists():
+        raise FileNotFoundError(f"Pending task not found: {task_id}")
     job_dir = dirs["running"] / task_id
     job_dir.mkdir(parents=True, exist_ok=True)
     dst = job_dir / "task.json"
@@ -314,6 +613,14 @@ def load_session(config: dict[str, Any]) -> dict[str, Any] | None:
 def save_session(config: dict[str, Any], session: dict[str, Any]) -> None:
     """Write claude_session.json."""
     save_json(_session_path(config), session)
+
+
+def analysis_follow_up_tasks(analysis: dict[str, Any], *, parent_task: dict[str, Any]) -> list[dict[str, Any]]:
+    follow_ups: list[dict[str, Any]] = []
+    if analysis.get("next_task"):
+        follow_ups.append(analysis["next_task"])
+    follow_ups.extend(analysis.get("next_tasks") or [])
+    return [normalize_task(task, parent_task=parent_task) for task in follow_ups]
 
 
 def build_codex_prompt(config: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -> str:

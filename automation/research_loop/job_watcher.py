@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dumb, deterministic job watcher. Tracks PID, log freshness, timeout. No research judgment.
 
-The watcher launches the analyst (gpt-5.4, xhigh) directly — the analyst is the smart
+The watcher launches the analyst directly — the analyst is the smart
 coordinator that reads the task, spawns codex-mini subagents for implementation/eval,
 and writes structured results. The watcher only monitors the process lifecycle.
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = Path(__file__).resolve().parent / "schemas"
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 
 def _utc_now_iso() -> str:
@@ -57,7 +58,7 @@ Files to read first:
 
 ## How to work
 
-1. **Read** the task and relevant project files
+1. **Read** the task and relevant project files first
 2. **Plan** how to break the task into concrete steps
 3. **Spawn codex-mini subagents** for implementation, eval, and diagnostic work:
 
@@ -71,7 +72,7 @@ codex exec --skip-git-repo-check -m gpt-5.1-codex-mini \\
 
 4. **Review** subagent output and validate results
 5. **Decide**: accept | reject | rerun | diagnose | escalate
-6. If continuing, write the next task to {queue_base}/pending/<task_id>.json
+6. If continuing, emit `next_task` or `next_tasks` in your structured JSON output. The glue layer will queue and dispatch them.
 
 ## Decision framework
 
@@ -90,10 +91,32 @@ write REVIEW_REQUESTED.json in {job_dir} with:
 - blocked: you need a decision to proceed
 - progress: informational, you keep running
 
+## Dependency graph discipline
+
+- All follow-up tasks in this task frame must share one `graph_id`
+- Reuse one `task_group_id` / `task_group_title` for tasks that belong to the same research question so Claude can synthesize the whole group later
+- Use `depends_on` to express ordering edges
+- Use `conflict_keys` to serialize tasks that touch the same write surface
+- Emit multiple tasks in `next_tasks` when independent branches can run in parallel
+- Keep `next_task` for a single follow-up if only one branch is needed
+- Choose `timeout_minutes` deliberately for each follow-up task instead of reusing one default everywhere
+- Keep bounded diagnostics or small verification runs relatively short; use longer timeouts only for tasks that truly need longer implementation/eval loops or benchmark runtime
+- If two tasks might edit the same files, docs, or benchmark artifacts, give them the same `conflict_keys`
+- When uncertain, be conservative: prefer broader keys like `code`, `docs`, `eval:webqsp`, or `eval:benchmark` instead of over-fragmenting
+- If you are not confident two branches are independent, serialize them rather than parallelizing them
+
 ## Output
 
 Return structured JSON matching the codex_post_run schema with your decision,
-metrics comparison, diagnosis, and next_task if applicable."""
+metrics comparison, diagnosis, and `next_task` / `next_tasks` if applicable."""
+
+
+def _load_default_reasoning_effort() -> str:
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return "medium"
+    return str(config.get("codex", {}).get("reasoning_effort") or "medium")
 
 
 def _kill_gracefully(pid: int, grace: int = 10) -> None:
@@ -215,6 +238,7 @@ def main() -> None:
 
     task = json.loads(args.task.read_text(encoding="utf-8"))
     task_id = task["task_id"]
+    reasoning_effort = str(task.get("analyst_reasoning_effort") or _load_default_reasoning_effort())
 
     # Job directory is parent of the task file (queue/running/{task_id}/)
     job_dir = args.task.parent
@@ -226,11 +250,11 @@ def main() -> None:
 
     prompt = _build_analyst_prompt(task, job_dir)
 
-    # Launch the analyst (gpt-5.4, xhigh) — it spawns codex-mini subagents as needed
+    # Launch the analyst with task- or config-selected reasoning effort.
     command = [
         "codex", "exec", "--skip-git-repo-check",
         "-m", "gpt-5.4",
-        "--config", 'model_reasoning_effort="high"',
+        "--config", f'model_reasoning_effort="{reasoning_effort}"',
         "--sandbox", "workspace-write",
         "--full-auto",
         "-C", str(ROOT),
@@ -276,6 +300,7 @@ def main() -> None:
             "pid": pid,
             "elapsed_minutes": round(elapsed / 60, 1),
             "timeout_minutes": args.timeout,
+            "reasoning_effort": reasoning_effort,
             "subagent_count": subagent_count,
             "last_heartbeat_utc": _utc_now_iso(),
         })
