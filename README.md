@@ -170,6 +170,44 @@ Claude (director)  -->  Analyst (Codex, high reasoning)  -->  Workers (codex-min
 - **Tracker doc as shared world model** — all agents are grounded by the same living document rather than ephemeral prompt context.
 - **Planner handoff artifact** — every notification writes `planner_handoff.json`, which gives another capable reviewer instance enough queue/state context to temporarily pick up scheduling work.
 
+## Temporary Reviewer Takeover
+
+The framework supports a temporary reviewer handoff when the primary reviewer is unavailable.
+
+Typical case:
+
+- Claude is the normal reviewer/director.
+- A second reviewer instance (for example Codex) needs to keep the loop moving for a while.
+- The secondary reviewer should not pretend to be the primary reviewer; it should do bounded review/queue-management work and leave high-level synthesis decisions in a clean handoff artifact.
+
+How it works:
+
+1. Save the active reviewer bridge in `results/research_loop/reviewer_session.json`.
+   - Set `provider` to the current reviewer (`claude` or `codex`).
+   - Use `mode: "interactive"` when the current harness can surface completions in-session.
+   - Use `mode: "cli"` when the glue layer should explicitly resume the reviewer via its CLI.
+2. Let the existing watcher/glue path keep doing normal work.
+   - `job_watcher.py` still monitors the analyst.
+   - `run_post_job.sh` still moves queue state and writes completion artifacts.
+3. Use `planner_handoff.json` as the portable takeover artifact.
+   - It contains queue counts, latest completed/failed jobs, stale graphs, current reviewer session metadata, and the paths a reviewer needs to continue.
+4. The temporary reviewer can then do bounded queue management:
+   - inspect `status.sh`, `graph_summary.py`, and `task_group_summary.py`
+   - review the latest completed analyses
+   - reprioritize pending tasks
+   - add short synthesis/report tasks for finished result lines
+   - dispatch the next safe batch
+
+Recommended reviewer-takeover policy:
+
+- Keep existing background execution intact; do not replace the watcher/glue layer.
+- Favor bounded queue grooming and result synthesis over major strategic pivots.
+- When a task group is `ready_for_synthesis`, either synthesize it or leave a clear note for the primary reviewer.
+- Prefer adding explicit report/synthesis tasks rather than leaving valuable completed work as stale artifacts only.
+- If the queue is being redirected toward a new result wave, write a short grooming note (for example `QUEUE_GROOMING_YYYY-MM-DD.md`) that explains the launch order and why.
+
+This pattern is especially useful when the primary reviewer has quota or availability limits but you still want the loop to keep producing defensible progress.
+
 ## Directory Structure
 
 ```
@@ -241,6 +279,15 @@ Clone this repo and ask claude to install, or manually:
    ```bash
    cp docs/sample_tracker.md IMPROVEMENTS.md
    ```
+
+### Optional: enable temporary reviewer takeover
+
+If you want a secondary reviewer to be able to take over queue grooming or synthesis temporarily:
+
+- keep `reviewer.provider` in `config.json` accurate for the current reviewer
+- persist `results/research_loop/reviewer_session.json`
+- treat `results/research_loop/planner_handoff.json` as the portable handoff bundle
+- have the secondary reviewer read queue state first, then make bounded reprioritization/synthesis changes instead of blindly launching the highest-priority stale task
 
 ### Configuration
 

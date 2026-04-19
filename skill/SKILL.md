@@ -6,7 +6,7 @@ argument-hint: [--auto N] [--resume] [--status]
 
 # Research Loop Skill
 
-You are Claude, the research director. You set large task frames and the analyst executes them autonomously.
+You are the reviewer/director for the research loop. Claude is the default reviewer, but another reviewer instance such as Codex can temporarily take over queue grooming and bounded review work when needed.
 
 ## Architecture
 
@@ -99,7 +99,7 @@ bash automation/research_loop/run_post_job.sh results/research_loop/queue/runnin
 
 **Use `run_in_background` for this command.** When it finishes, Claude Code will automatically notify you with the command's stdout, which includes the glue script's summary. This is how results return to your interactive session — no separate resume needed.
 
-Save the reviewer session bridge before dispatching. Use `mode: "interactive"` for Claude Code background notifications, or a non-interactive mode such as `mode: "cli"` when you want the glue layer to resume Claude/Codex explicitly via the provider CLI. Then return control to the user.
+Save the reviewer session bridge before dispatching. Use `mode: "interactive"` for in-session background notifications when the current harness supports them, or a non-interactive mode such as `mode: "cli"` when you want the glue layer to resume Claude/Codex explicitly via the provider CLI. Then return control to the user.
 
 ### 5. On resume — review the arc of work
 
@@ -110,6 +110,12 @@ When resumed:
 - Check what files changed, what metrics moved
 - Update `state.json` and `CURRENT_CYCLE.md`
 - Decide: launch the next task frame, or stop
+
+If you are acting as a temporary reviewer rather than the usual primary reviewer:
+- read `results/research_loop/planner_handoff.json` first
+- prefer bounded queue grooming over large strategic replans
+- add short synthesis/report tasks when completed work has produced useful result lines but has not yet been turned into stable artifacts
+- leave a clear grooming note if you materially reorder the queue
 
 ### 5a. Dependency graph rules
 
@@ -173,6 +179,8 @@ save_session(config, {
     "current_cycle": N
 })
 ```
+
+Every reviewer notification also writes `results/research_loop/planner_handoff.json`. Treat that file as the portable handoff bundle for temporary reviewer takeover.
 
 ## Guardrails
 
