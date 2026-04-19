@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Post-job glue: queue management + selective Claude resume.
+# Post-job glue: queue management + selective reviewer resume.
 #
 # The analyst self-iterates through a dependency graph:
 # - completed jobs may fan out into multiple next tasks
 # - runnable tasks are dispatched up to the parallelism cap
-# - Claude is only resumed when the graph is done, blocked, or explicitly escalated
+# - The reviewer is only resumed when the graph is done, blocked, or explicitly escalated
 #
 # Usage: run_post_job.sh JOB_DIR
 set -euo pipefail
@@ -12,52 +12,52 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 JOB_DIR="${1:?Usage: run_post_job.sh JOB_DIR}"
 QUEUE_BASE="$REPO_ROOT/results/research_loop/queue"
-SESSION_FILE="$REPO_ROOT/results/research_loop/claude_session.json"
 CONFIG_FILE="$REPO_ROOT/automation/research_loop/config.json"
 DISPATCHER="$REPO_ROOT/automation/research_loop/dispatch_ready_tasks.py"
 
 STATUS=$(python3 -c "import json; print(json.load(open('$JOB_DIR/job_status.json'))['status'])")
 JOB_ID=$(python3 -c "import json; print(json.load(open('$JOB_DIR/job_status.json'))['job_id'])")
 
-notify_claude() {
+notify_reviewer() {
     local message="$1"
-    if [ ! -f "$SESSION_FILE" ]; then
-        echo "[post-job] no session file — writing completion marker only"
-        echo "$message" > "$QUEUE_BASE/../loop_completion.txt"
-        return
-    fi
-    MODE=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('mode',''))")
-    SID=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('session_id',''))")
+    local trigger="${2:-job_update}"
+    local output
+    if ! output=$(PYTHONPATH="$REPO_ROOT" python3 - <<'PY' "$CONFIG_FILE" "$message" "$trigger"
+import json
+import sys
+from pathlib import Path
 
-    if [ "$MODE" = "interactive" ]; then
-        echo ""
-        echo "=== Research Loop Result ==="
-        echo "$message"
-        echo "============================="
-        echo "$message" > "$QUEUE_BASE/../loop_completion.txt"
-    elif [ -n "$SID" ]; then
-        echo "[post-job] resuming Claude session $SID"
-        claude -p --resume "$SID" "$message" 2>/dev/null || true
-    else
-        echo "[post-job] no session_id — writing completion marker only"
-        echo "$message" > "$QUEUE_BASE/../loop_completion.txt"
+from lib.research_loop import load_config, notify_reviewer
+
+config_path = Path(sys.argv[1]).resolve()
+message = sys.argv[2]
+trigger = sys.argv[3]
+repo_root = config_path.parents[2]
+config = load_config(config_path, repo_root)
+result = notify_reviewer(config, message, trigger=trigger)
+print(json.dumps(result))
+PY
+); then
+        echo "[post-job] reviewer notify failed for trigger=$trigger" >&2
+        return 0
     fi
+    echo "[post-job] reviewer notify: $output"
 }
 
 if [ "$STATUS" != "completed" ]; then
-    echo "[post-job] $JOB_ID: $STATUS — moving to failed, notifying Claude"
+    echo "[post-job] $JOB_ID: $STATUS — moving to failed, notifying reviewer"
     mkdir -p "$QUEUE_BASE/failed"
     mv "$JOB_DIR" "$QUEUE_BASE/failed/$JOB_ID" 2>/dev/null || true
-    notify_claude "Job $JOB_ID finished with status: $STATUS. Check results/research_loop/queue/failed/$JOB_ID/ for details."
+    notify_reviewer "Job $JOB_ID finished with status: $STATUS. Check results/research_loop/queue/failed/$JOB_ID/ for details." "job_failed"
     exit 0
 fi
 
 ANALYSIS_FILE="$JOB_DIR/analysis.json"
 if [ ! -f "$ANALYSIS_FILE" ]; then
-    echo "[post-job] $JOB_ID: no analysis.json — notifying Claude"
+    echo "[post-job] $JOB_ID: no analysis.json — notifying reviewer"
     mkdir -p "$QUEUE_BASE/completed"
     mv "$JOB_DIR" "$QUEUE_BASE/completed/$JOB_ID" 2>/dev/null || true
-    notify_claude "Job $JOB_ID completed but analyst produced no analysis. Check results/research_loop/queue/completed/$JOB_ID/"
+    notify_reviewer "Job $JOB_ID completed but analyst produced no analysis. Check results/research_loop/queue/completed/$JOB_ID/" "missing_analysis"
     exit 0
 fi
 
@@ -129,7 +129,7 @@ PY
 
 QUEUE_ERROR=$(python3 -c "import json; print(json.loads('''$QUEUE_OUTPUT''').get('error') or '')")
 if [ -n "$QUEUE_ERROR" ]; then
-    notify_claude "Graph $GRAPH_ID hit a queueing error after job $JOB_ID: $QUEUE_ERROR. Check results/research_loop/queue/completed/$JOB_ID/analysis.json"
+    notify_reviewer "Graph $GRAPH_ID hit a queueing error after job $JOB_ID: $QUEUE_ERROR. Check results/research_loop/queue/completed/$JOB_ID/analysis.json" "queue_error"
     exit 0
 fi
 
@@ -176,24 +176,24 @@ BLOCKED_COUNT=$(python3 -c "import json; print(len(json.loads('''$GRAPH_STATE'''
 FAILED_COUNT=$(python3 -c "import json; print(len(json.loads('''$GRAPH_STATE''')['failed']))")
 
 if [[ "$DECISION" =~ ^(accept|rerun|diagnose)$ ]] && { [ "$RUNNING_COUNT" -gt 0 ] || [ "$RUNNABLE_COUNT" -gt 0 ]; }; then
-    echo "[post-job] graph $GRAPH_ID still active: running=$RUNNING_COUNT runnable=$RUNNABLE_COUNT blocked=$BLOCKED_COUNT (Claude NOT notified)"
+    echo "[post-job] graph $GRAPH_ID still active: running=$RUNNING_COUNT runnable=$RUNNABLE_COUNT blocked=$BLOCKED_COUNT (reviewer NOT notified)"
     exit 0
 fi
 
 if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$RUNNING_COUNT" -eq 0 ] && [ "$RUNNABLE_COUNT" -eq 0 ]; then
-    notify_claude "Graph $GRAPH_ID / task group $TASK_GROUP_ID is blocked after job $JOB_ID (decision: $DECISION). Summary: $SUMMARY. Graph state: $GRAPH_STATE. Group state: $GROUP_STATE. Check results/research_loop/queue/completed/$JOB_ID/analysis.json"
+    notify_reviewer "Graph $GRAPH_ID / task group $TASK_GROUP_ID is blocked after job $JOB_ID (decision: $DECISION). Summary: $SUMMARY. Graph state: $GRAPH_STATE. Group state: $GROUP_STATE. Check results/research_loop/queue/completed/$JOB_ID/analysis.json" "graph_blocked"
     exit 0
 fi
 
 if [ "$FAILED_COUNT" -gt 0 ] && [ "$RUNNING_COUNT" -eq 0 ] && [ "$RUNNABLE_COUNT" -eq 0 ]; then
-    notify_claude "Graph $GRAPH_ID / task group $TASK_GROUP_ID has failed branches after job $JOB_ID (decision: $DECISION). Summary: $SUMMARY. Graph state: $GRAPH_STATE. Group state: $GROUP_STATE. Check results/research_loop/queue/completed/$JOB_ID/analysis.json"
+    notify_reviewer "Graph $GRAPH_ID / task group $TASK_GROUP_ID has failed branches after job $JOB_ID (decision: $DECISION). Summary: $SUMMARY. Graph state: $GRAPH_STATE. Group state: $GROUP_STATE. Check results/research_loop/queue/completed/$JOB_ID/analysis.json" "graph_failed"
     exit 0
 fi
 
 GROUP_STATUS=$(python3 -c "import json; print(json.loads('''$GROUP_STATE''')['status'])")
 if [ "$GROUP_STATUS" = "ready_for_synthesis" ]; then
-    notify_claude "Task group $TASK_GROUP_ID is ready for synthesis after job $JOB_ID in graph $GRAPH_ID (decision: $DECISION). Summary: $SUMMARY. Group state: $GROUP_STATE. Graph state: $GRAPH_STATE. Check results/research_loop/queue/completed/$JOB_ID/analysis.json"
+    notify_reviewer "Task group $TASK_GROUP_ID is ready for synthesis after job $JOB_ID in graph $GRAPH_ID (decision: $DECISION). Summary: $SUMMARY. Group state: $GROUP_STATE. Graph state: $GRAPH_STATE. Check results/research_loop/queue/completed/$JOB_ID/analysis.json" "ready_for_synthesis"
     exit 0
 fi
 
-notify_claude "Analyst completed job $JOB_ID in graph $GRAPH_ID / task group $TASK_GROUP_ID (decision: $DECISION). Summary: $SUMMARY. Graph state: $GRAPH_STATE. Group state: $GROUP_STATE. Full analysis at results/research_loop/queue/completed/$JOB_ID/analysis.json"
+notify_reviewer "Analyst completed job $JOB_ID in graph $GRAPH_ID / task group $TASK_GROUP_ID (decision: $DECISION). Summary: $SUMMARY. Graph state: $GRAPH_STATE. Group state: $GROUP_STATE. Full analysis at results/research_loop/queue/completed/$JOB_ID/analysis.json" "job_completed"

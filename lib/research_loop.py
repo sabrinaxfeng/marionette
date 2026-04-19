@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,9 @@ def load_config(path: Path, root: Path) -> dict[str, Any]:
         "state_json": "results/research_loop/state.json",
         "cycles_dir": "results/research_loop/cycles",
     }
+    reviewer_defaults = {
+        "provider": "claude",
+    }
     claude_defaults = {"model": "opus", "effort": "medium"}
     codex_defaults = {
         "model": "gpt-5.4",
@@ -55,6 +59,7 @@ def load_config(path: Path, root: Path) -> dict[str, Any]:
     data.setdefault("target_value", None)
     data["stop_conditions"] = {**stop_defaults, **data.get("stop_conditions", {})}
     data["paths"] = {**path_defaults, **data.get("paths", {})}
+    data["reviewer"] = {**reviewer_defaults, **data.get("reviewer", {})}
     data["claude"] = {**claude_defaults, **data.get("claude", {})}
     data["codex"] = {**codex_defaults, **data.get("codex", {})}
     resolved_paths = {}
@@ -598,21 +603,214 @@ def complete_job(config: dict[str, Any], job_dir: Path, target: str = "completed
 # --- Session bridge ---
 
 
+def loop_root(config: dict[str, Any]) -> Path:
+    return Path(config["paths"]["cycles_dir"]).parent
+
+
+def completion_marker_path(config: dict[str, Any]) -> Path:
+    return loop_root(config) / "loop_completion.txt"
+
+
+def planner_handoff_path(config: dict[str, Any]) -> Path:
+    return loop_root(config) / "planner_handoff.json"
+
+
+def _legacy_session_path(config: dict[str, Any]) -> Path:
+    return loop_root(config) / "claude_session.json"
+
+
 def _session_path(config: dict[str, Any]) -> Path:
-    return Path(config["paths"]["cycles_dir"]).parent / "claude_session.json"
+    return loop_root(config) / "reviewer_session.json"
+
+
+def _normalize_session(config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(session)
+    normalized.setdefault("provider", str(config.get("reviewer", {}).get("provider") or "claude"))
+    normalized.setdefault("mode", "interactive")
+    normalized.setdefault("status", "waiting")
+    return normalized
 
 
 def load_session(config: dict[str, Any]) -> dict[str, Any] | None:
-    """Read claude_session.json if it exists."""
+    """Read reviewer_session.json if it exists, else fall back to legacy claude_session.json."""
     path = _session_path(config)
-    if not path.exists():
-        return None
-    return load_json(path)
+    legacy_path = _legacy_session_path(config)
+    if path.exists():
+        return _normalize_session(config, load_json(path))
+    if legacy_path.exists():
+        session = load_json(legacy_path)
+        session.setdefault("provider", "claude")
+        return _normalize_session(config, session)
+    return None
 
 
 def save_session(config: dict[str, Any], session: dict[str, Any]) -> None:
-    """Write claude_session.json."""
-    save_json(_session_path(config), session)
+    """Write reviewer_session.json with normalized provider metadata."""
+    save_json(_session_path(config), _normalize_session(config, session))
+
+
+def queue_task_counts(config: dict[str, Any]) -> dict[str, int]:
+    return {
+        queue_name: len(load_tasks(config, queue_name))
+        for queue_name in ("pending", "running", "completed", "failed")
+    }
+
+
+def _latest_job_in_queue(config: dict[str, Any], queue_name: str) -> dict[str, Any] | None:
+    tasks = load_tasks(config, queue_name)
+    if not tasks:
+        return None
+    tasks.sort(key=lambda task: Path(task["_path"]).stat().st_mtime, reverse=True)
+    task = tasks[0]
+    task_path = Path(task["_path"])
+    job_dir = task_path.parent if task["_queue"] != "pending" else None
+    payload: dict[str, Any] = {
+        "task_id": task["task_id"],
+        "graph_id": task["graph_id"],
+        "task_group_id": task["task_group_id"],
+        "objective": task["objective"],
+        "queue": queue_name,
+        "task_path": str(task_path),
+    }
+    if job_dir is not None:
+        payload["job_dir"] = str(job_dir)
+        for name in ("analysis.json", "job_status.json", "review_status.json"):
+            artifact = job_dir / name
+            if artifact.exists():
+                payload[name[:-5]] = load_json(artifact)
+    return payload
+
+
+def build_planner_handoff(config: dict[str, Any], *, trigger: str, message: str) -> dict[str, Any]:
+    state = load_state(Path(config["paths"]["state_json"]), config)
+    graphs = graph_summaries(config, stale_after_minutes=int(config.get("stale_graph_minutes", 120) or 120))
+    task_groups = task_group_summaries(config)
+    current_cycle_path = Path(config["paths"]["current_cycle_markdown"])
+    return {
+        "generated_at_utc": utc_now_iso(),
+        "trigger": trigger,
+        "message": message,
+        "goal": config.get("goal"),
+        "session": load_session(config),
+        "paths": {
+            "state_json": config["paths"]["state_json"],
+            "current_cycle_markdown": str(current_cycle_path),
+            "planner_handoff_json": str(planner_handoff_path(config)),
+            "completion_marker": str(completion_marker_path(config)),
+        },
+        "loop": {
+            "status": state.get("status", "unknown"),
+            "stop_reason": state.get("stop_reason"),
+            "last_updated_utc": state.get("last_updated_utc"),
+            "latest_cycle": latest_cycle(state),
+        },
+        "queue_counts": queue_task_counts(config),
+        "latest_completed_job": _latest_job_in_queue(config, "completed"),
+        "latest_failed_job": _latest_job_in_queue(config, "failed"),
+        "stale_graphs": [graph for graph in graphs if graph.get("stale")],
+        "blocked_graphs": [graph for graph in graphs if graph.get("status") == "blocked"],
+        "ready_for_review_graphs": [graph for graph in graphs if graph.get("status") == "ready_for_review"],
+        "ready_for_synthesis_groups": [group for group in task_groups if group.get("status") == "ready_for_synthesis"],
+        "reviewer_takeover_notes": [
+            "Read CURRENT_CYCLE.md and the tracker document before queuing new work.",
+            "Review blocked graphs, stale graphs, and ready_for_synthesis task groups first.",
+            "If taking over temporarily, preserve graph_id/task_group_id continuity rather than minting ad hoc replacements.",
+            "If no session resume path works, write the next decision to the completion marker and queue explicit follow-up tasks.",
+        ],
+    }
+
+
+def write_planner_handoff(config: dict[str, Any], *, trigger: str, message: str) -> Path:
+    path = planner_handoff_path(config)
+    save_json(path, build_planner_handoff(config, trigger=trigger, message=message))
+    return path
+
+
+def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeout_s: int = 120) -> dict[str, Any]:
+    marker_path = completion_marker_path(config)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(message + "\n", encoding="utf-8")
+    handoff_path = write_planner_handoff(config, trigger=trigger, message=message)
+
+    session = load_session(config)
+    if not session:
+        return {
+            "status": "marker_only",
+            "provider": None,
+            "session_id": None,
+            "completion_marker": str(marker_path),
+            "planner_handoff": str(handoff_path),
+        }
+
+    mode = str(session.get("mode") or "")
+    provider = str(session.get("provider") or config.get("reviewer", {}).get("provider") or "claude")
+    session_id = str(session.get("session_id") or "")
+    if mode == "interactive":
+        return {
+            "status": "interactive_marker",
+            "provider": provider,
+            "session_id": session_id or None,
+            "completion_marker": str(marker_path),
+            "planner_handoff": str(handoff_path),
+        }
+
+    if not session_id:
+        return {
+            "status": "marker_only",
+            "provider": provider,
+            "session_id": None,
+            "completion_marker": str(marker_path),
+            "planner_handoff": str(handoff_path),
+        }
+
+    if provider == "claude":
+        command = ["claude", "-p", "--resume", session_id, message]
+    elif provider == "codex":
+        command = ["codex", "exec", "resume", session_id, message]
+    else:
+        return {
+            "status": "unsupported_provider",
+            "provider": provider,
+            "session_id": session_id,
+            "completion_marker": str(marker_path),
+            "planner_handoff": str(handoff_path),
+        }
+
+    try:
+        cp = subprocess.run(command, check=False, timeout=timeout_s, capture_output=True, text=True)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "resume_timeout",
+            "provider": provider,
+            "session_id": session_id,
+            "command": command,
+            "timeout_s": timeout_s,
+            "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+            "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else "",
+            "completion_marker": str(marker_path),
+            "planner_handoff": str(handoff_path),
+        }
+    except OSError as exc:
+        return {
+            "status": "resume_error",
+            "provider": provider,
+            "session_id": session_id,
+            "command": command,
+            "error": str(exc),
+            "completion_marker": str(marker_path),
+            "planner_handoff": str(handoff_path),
+        }
+    return {
+        "status": "resumed" if cp.returncode == 0 else "resume_failed",
+        "provider": provider,
+        "session_id": session_id,
+        "command": command,
+        "returncode": cp.returncode,
+        "stdout": cp.stdout.strip(),
+        "stderr": cp.stderr.strip(),
+        "completion_marker": str(marker_path),
+        "planner_handoff": str(handoff_path),
+    }
 
 
 def analysis_follow_up_tasks(analysis: dict[str, Any], *, parent_task: dict[str, Any]) -> list[dict[str, Any]]:

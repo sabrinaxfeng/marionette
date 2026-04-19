@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from lib.research_loop import load_config, notify_reviewer
+
 SCHEMA_DIR = Path(__file__).resolve().parent / "schemas"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
@@ -34,11 +39,11 @@ def _write_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
-def _build_analyst_prompt(task: dict, job_dir: Path) -> str:
+def _build_analyst_prompt(task: dict, job_dir: Path, reviewer_name: str) -> str:
     instructions = "\n".join(f"- {i}" for i in task.get("instructions", []))
     files = "\n".join(task.get("files_to_read", []))
     queue_base = job_dir.parents[1]
-    return f"""You are the research analyst for an autonomous Claude-Codex research loop.
+    return f"""You are the research analyst for an autonomous research loop.
 You have deep reasoning capability and can spawn subagents for implementation work.
 
 ## Your task
@@ -80,11 +85,11 @@ codex exec --skip-git-repo-check -m gpt-5.1-codex-mini \\
 - **reject**: regression or bad code → revert, propose fix
 - **rerun**: methodology issue → fix it yourself or via subagent, then rerun
 - **diagnose**: need more data → spawn diagnostic subagent, then decide
-- **escalate**: architectural decision or ambiguity → explain why Claude should review
+- **escalate**: architectural decision or ambiguity → explain why {reviewer_name} should review
 
 ## Review signaling
 
-If you reach a natural checkpoint and want Claude to review before you continue,
+If you reach a natural checkpoint and want {reviewer_name} to review before you continue,
 write REVIEW_REQUESTED.json in {job_dir} with:
   {{"reason": "checkpoint"|"blocked"|"progress", "message": "...", "artifacts": [...], "stage": "..."}}
 - checkpoint: you'll be paused until review completes
@@ -94,7 +99,7 @@ write REVIEW_REQUESTED.json in {job_dir} with:
 ## Dependency graph discipline
 
 - All follow-up tasks in this task frame must share one `graph_id`
-- Reuse one `task_group_id` / `task_group_title` for tasks that belong to the same research question so Claude can synthesize the whole group later
+- Reuse one `task_group_id` / `task_group_title` for tasks that belong to the same research question so the reviewer can synthesize the whole group later
 - Use `depends_on` to express ordering edges
 - Use `conflict_keys` to serialize tasks that touch the same write surface
 - Emit multiple tasks in `next_tasks` when independent branches can run in parallel
@@ -140,7 +145,7 @@ def _kill_gracefully(pid: int, grace: int = 10) -> None:
 REVIEW_SIGNAL = "REVIEW_REQUESTED.json"
 
 
-def _check_review_signal(job_dir: Path, pid: int, task_id: str) -> None:
+def _check_review_signal(job_dir: Path, pid: int, task_id: str, config: dict) -> None:
     """Check if the analyst dropped a review signal. Handle by type."""
     signal_path = job_dir / REVIEW_SIGNAL
     if not signal_path.exists():
@@ -159,7 +164,7 @@ def _check_review_signal(job_dir: Path, pid: int, task_id: str) -> None:
         signal_path.rename(job_dir / f"review_progress_{_utc_now_iso().replace(':', '-')}.json")
         return
 
-    # checkpoint or blocked — pause analyst, invoke Claude, then decide
+    # checkpoint or blocked — pause analyst, notify reviewer, then decide
     try:
         os.kill(pid, signal.SIGSTOP)
     except OSError:
@@ -174,26 +179,26 @@ def _check_review_signal(job_dir: Path, pid: int, task_id: str) -> None:
         "paused_at_utc": _utc_now_iso(),
     })
 
-    # Try to notify Claude via session resume
-    session_path = job_dir.parents[2] / "claude_session.json"
-    if session_path.exists():
-        try:
-            session = json.loads(session_path.read_text(encoding="utf-8"))
-            sid = session.get("session_id", "")
-            if sid:
-                review_payload = json.dumps(sig, indent=2)
-                subprocess.run(
-                    ["claude", "-p", "--resume", sid,
-                     f"Codex analyst requests review for job {task_id} ({reason}): {message}\n\n"
-                     f"Artifacts: {sig.get('artifacts', [])}\n"
-                     f"Stage: {sig.get('stage', 'unknown')}\n\n"
-                     f"The analyst is paused. Reply with the result in "
-                     f"{job_dir / 'REVIEW_RESPONSE.json'} then the watcher will resume.\n\n"
-                     f"Signal payload:\n{review_payload}"],
-                    capture_output=True, text=True, timeout=120,
-                )
-        except Exception as exc:
-            print(f"[watcher] {task_id}: claude resume failed: {exc}", flush=True)
+    try:
+        review_payload = json.dumps(sig, indent=2)
+        review_message = (
+            f"Analyst requests review for job {task_id} ({reason}): {message}\n\n"
+            f"Artifacts: {sig.get('artifacts', [])}\n"
+            f"Stage: {sig.get('stage', 'unknown')}\n"
+            f"Review response path: {job_dir / 'REVIEW_RESPONSE.json'}\n\n"
+            f"The analyst is paused. Write REVIEW_RESPONSE.json with "
+            '{"action": "continue"} or {"action": "abort"} to let the watcher decide next steps.\n\n'
+            f"Signal payload:\n{review_payload}"
+        )
+        notify_result = notify_reviewer(config, review_message, trigger=f"review_{reason}")
+        _write_json(job_dir / "review_notify.json", notify_result)
+        print(
+            f"[watcher] {task_id}: reviewer notify status={notify_result.get('status')} "
+            f"provider={notify_result.get('provider')}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[watcher] {task_id}: reviewer notify failed: {exc}", flush=True)
 
     # Wait for review response
     response_path = job_dir / "REVIEW_RESPONSE.json"
@@ -236,9 +241,12 @@ def main() -> None:
     parser.add_argument("--poll-interval", type=int, default=10, help="Poll interval in seconds")
     args = parser.parse_args()
 
+    config = load_config(CONFIG_PATH, ROOT)
     task = json.loads(args.task.read_text(encoding="utf-8"))
     task_id = task["task_id"]
     reasoning_effort = str(task.get("analyst_reasoning_effort") or _load_default_reasoning_effort())
+    reviewer_provider = str(config.get("reviewer", {}).get("provider") or "reviewer").strip().lower()
+    reviewer_name = {"claude": "Claude", "codex": "Codex"}.get(reviewer_provider, "the reviewer")
 
     # Job directory is parent of the task file (queue/running/{task_id}/)
     job_dir = args.task.parent
@@ -248,7 +256,7 @@ def main() -> None:
     status_path = job_dir / "job_status.json"
     schema_path = SCHEMA_DIR / "codex_post_run.schema.json"
 
-    prompt = _build_analyst_prompt(task, job_dir)
+    prompt = _build_analyst_prompt(task, job_dir, reviewer_name)
 
     # Launch the analyst with task- or config-selected reasoning effort.
     command = [
@@ -310,7 +318,7 @@ def main() -> None:
             _kill_gracefully(pid)
             break
 
-        _check_review_signal(job_dir, pid, task_id)
+        _check_review_signal(job_dir, pid, task_id, config)
 
     exit_code = proc.wait()
     if status == "completed" and exit_code != 0:

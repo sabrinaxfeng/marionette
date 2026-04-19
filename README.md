@@ -160,21 +160,22 @@ Claude (director)  -->  Analyst (Codex, high reasoning)  -->  Workers (codex-min
 ## Key Design Decisions
 
 - **File-backed queue** (`pending/` -> `running/` -> `completed/` | `failed/`) — no database, no daemon, fully inspectable.
-- **Analyst self-iteration** — the glue script silently chains `next_task` / `next_tasks` without notifying Claude. This keeps Claude's context window free for high-level direction.
+- **Analyst self-iteration** — the glue script silently chains `next_task` / `next_tasks` without notifying the reviewer. This keeps the high-level review context free for direction instead of micro-steps.
 - **Dependency graph + conflict keys** — tasks can fan out into parallel branches via `depends_on`, while `conflict_keys` serialize branches that touch the same write surface.
-- **Task groups over graphs** — DAGs handle execution order; `task_group_id` lets Claude synthesize several related tasks as one research thread.
+- **Task groups over graphs** — DAGs handle execution order; `task_group_id` lets the reviewer synthesize several related tasks as one research thread.
 - **Operational visibility** — graph summaries, task-group summaries, stale-graph detection, and a local dashboard make the queue inspectable without reading raw JSON by hand.
 - **Structured output contracts** — JSON schemas for tasks, results, and job status ensure the analyst's output is machine-parseable.
-- **Review signals** — the analyst can pause itself and write `REVIEW_REQUESTED.json` to escalate to Claude on architectural decisions or ambiguities.
-- **Dual-mode session bridge** — works from both interactive chat and CLI (`claude -p`). In interactive mode, the watcher+glue chain runs via `run_in_background` and results flow back as a background notification to the active session. In CLI mode, the glue script calls `claude --resume` to spawn a continuation. `claude_session.json` records the mode so the glue script knows which path to take.
+- **Review signals** — the analyst can pause itself and write `REVIEW_REQUESTED.json` to escalate to the reviewer on architectural decisions or ambiguities.
+- **Dual-mode reviewer bridge** — works with a reviewer session recorded in `reviewer_session.json`. Claude can keep using the current interactive-background flow, while Codex or Claude CLI reviewers can be resumed through provider-specific `resume` commands when `mode` is non-interactive.
 - **Tracker doc as shared world model** — all agents are grounded by the same living document rather than ephemeral prompt context.
+- **Planner handoff artifact** — every notification writes `planner_handoff.json`, which gives another capable reviewer instance enough queue/state context to temporarily pick up scheduling work.
 
 ## Directory Structure
 
 ```
 automation/research_loop/
   job_watcher.py          # Launches analyst, monitors PID, enforces timeout
-  run_post_job.sh         # Glue: reads analysis.json, chains next_task or resumes Claude
+  run_post_job.sh         # Glue: reads analysis.json, chains next_task or resumes the reviewer
   dispatch_ready_tasks.py # Scheduler: launches runnable DAG nodes up to max_parallel_jobs
   status.sh               # Quick status check for running jobs + queue counts
   graph_summary.py        # Graph-level summaries, including stale detection

@@ -10,6 +10,9 @@
     "max_consecutive_stagnant_cycles": 2,
     "max_consecutive_regressions": 1
   },
+  "reviewer": {
+    "provider": "claude"
+  },
   "claude": {
     "model": "opus",
     "effort": "medium"

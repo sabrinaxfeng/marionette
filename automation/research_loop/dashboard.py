@@ -19,6 +19,7 @@ from lib.research_loop import (
     graph_summaries,
     load_config,
     load_json,
+    load_session,
     load_tasks,
     queue_task_counts,
     runnable_pending_tasks,
@@ -141,9 +142,11 @@ def build_dashboard_payload(config: dict) -> dict:
     loop_root = _loop_root(config)
     state_path = Path(config["paths"]["state_json"])
     stale_report_path = loop_root / "stale_graphs.json"
+    planner_handoff_path = loop_root / "planner_handoff.json"
     state = _load_optional_json(state_path) or {}
-    session = _load_optional_json(loop_root / "claude_session.json") or {}
+    session = load_session(config) or {}
     stale_report = _load_optional_json(stale_report_path) or {}
+    planner_handoff = _load_optional_json(planner_handoff_path) or {}
     completion_message = _load_optional_text(loop_root / "loop_completion.txt")
     graphs = graph_summaries(config, stale_after_minutes=int(config.get("stale_graph_minutes", 120) or 120))
     task_groups = task_group_summaries(config)
@@ -169,6 +172,7 @@ def build_dashboard_payload(config: dict) -> dict:
             "latest_cycle": latest_cycle,
         },
         "session": session,
+        "planner_handoff": planner_handoff,
         "queue_counts": queue_counts,
         "overview": {
             "running_jobs": len(running),

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -11,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lib.research_loop import load_config, load_session, save_json, stale_graph_summaries
+from lib.research_loop import load_config, notify_reviewer, save_json, stale_graph_summaries
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,16 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="automation/research_loop/config.json",
         help="Path to research-loop config.json",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Report stale graphs without notifying Claude")
+    parser.add_argument("--dry-run", action="store_true", help="Report stale graphs without notifying the reviewer")
     return parser
 
 
 def _alert_cache_path(config: dict) -> Path:
     return Path(config["paths"]["cycles_dir"]).parent / "stale_graph_alerts.json"
-
-
-def _loop_completion_path(config: dict) -> Path:
-    return Path(config["paths"]["cycles_dir"]).parent / "loop_completion.txt"
 
 
 def _load_alert_cache(path: Path) -> dict[str, str]:
@@ -43,29 +38,9 @@ def _load_alert_cache(path: Path) -> dict[str, str]:
     return {str(key): str(value) for key, value in payload.items()}
 
 
-def _notify_claude(config: dict, message: str) -> None:
-    session = load_session(config)
-    if not session:
-        _loop_completion_path(config).write_text(message + "\n", encoding="utf-8")
-        print("[stale-check] no session file; wrote loop_completion.txt", flush=True)
-        return
-
-    mode = str(session.get("mode") or "")
-    session_id = str(session.get("session_id") or "")
-    if mode == "interactive":
-        _loop_completion_path(config).write_text(message + "\n", encoding="utf-8")
-        print("=== Research Loop Result ===", flush=True)
-        print(message, flush=True)
-        print("============================", flush=True)
-        return
-
-    if session_id:
-        subprocess.run(["claude", "-p", "--resume", session_id, message], check=False, timeout=120)
-        print(f"[stale-check] resumed Claude session {session_id}", flush=True)
-        return
-
-    _loop_completion_path(config).write_text(message + "\n", encoding="utf-8")
-    print("[stale-check] no session_id; wrote loop_completion.txt", flush=True)
+def _notify_reviewer(config: dict, message: str) -> None:
+    result = notify_reviewer(config, message, trigger="stale_graphs")
+    print(f"[stale-check] notify result: {json.dumps(result)}", flush=True)
 
 
 def main() -> int:
@@ -117,7 +92,7 @@ def main() -> int:
 
     print(message, flush=True)
     if not args.dry_run:
-        _notify_claude(config, message)
+        _notify_reviewer(config, message)
     return 0
 
 

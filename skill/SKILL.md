@@ -99,7 +99,7 @@ bash automation/research_loop/run_post_job.sh results/research_loop/queue/runnin
 
 **Use `run_in_background` for this command.** When it finishes, Claude Code will automatically notify you with the command's stdout, which includes the glue script's summary. This is how results return to your interactive session — no separate resume needed.
 
-Save the session bridge before dispatching (with `mode: "interactive"`) so the glue script knows not to spawn a second Claude process. Then return control to the user. You will be automatically notified when the chain completes.
+Save the reviewer session bridge before dispatching. Use `mode: "interactive"` for Claude Code background notifications, or a non-interactive mode such as `mode: "cli"` when you want the glue layer to resume Claude/Codex explicitly via the provider CLI. Then return control to the user.
 
 ### 5. On resume — review the arc of work
 
@@ -166,8 +166,9 @@ This should be rare — the analyst should handle most decisions autonomously.
 Save before dispatching:
 ```python
 save_session(config, {
+    "provider": "claude",  # or "codex"
     "session_id": "<current session>",
-    "mode": "interactive",  # or "cli" if launched via claude -p
+    "mode": "interactive",  # or "cli" to force provider resume
     "status": "waiting",
     "current_cycle": N
 })
