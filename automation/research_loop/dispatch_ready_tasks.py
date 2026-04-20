@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from lib.research_loop import (  # noqa: E402
     claim_task,
+    held_graph_ids,
     load_config,
     queue_dirs,
     runnable_pending_tasks,
@@ -27,17 +28,11 @@ def _lock_path(config: dict) -> Path:
 
 
 def _launch_chain(*, repo_root: Path, job_dir: Path, timeout_minutes: int) -> None:
-    task_path = job_dir / "task.json"
-    watcher_path = repo_root / "automation" / "research_loop" / "job_watcher.py"
-    post_job_path = repo_root / "automation" / "research_loop" / "run_post_job.sh"
+    runner_path = repo_root / "automation" / "research_loop" / "run_claimed_job.sh"
     log_path = job_dir / "dispatch.log"
-    command = (
-        f'python3 "{watcher_path}" --task "{task_path}" --timeout "{timeout_minutes}" ; '
-        f'bash "{post_job_path}" "{job_dir}"'
-    )
     with log_path.open("a", encoding="utf-8") as log_file:
         subprocess.Popen(
-            ["bash", "-lc", command],
+            ["bash", str(runner_path), "--job-dir", str(job_dir), "--timeout", str(timeout_minutes)],
             cwd=repo_root,
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -54,22 +49,36 @@ def main() -> None:
         help="Path to the loop configuration JSON.",
     )
     parser.add_argument("--graph-id", type=str, default=None, help="Only dispatch tasks from one graph.")
+    parser.add_argument(
+        "--exclude-graph-id",
+        type=str,
+        default=None,
+        help="Never dispatch tasks from this graph in the current round.",
+    )
     parser.add_argument("--max-launch", type=int, default=None, help="Optional cap for this dispatch round.")
     parser.add_argument("--dry-run", action="store_true", help="Print runnable tasks without launching them.")
     args = parser.parse_args()
 
     config = load_config(args.config.resolve(), ROOT)
     max_parallel_jobs = max(1, int(config.get("max_parallel_jobs", 1) or 1))
-    available_slots = max_parallel_jobs - len(running_tasks(config))
-    if args.max_launch is not None:
-        available_slots = min(available_slots, max(0, args.max_launch))
 
     lock_path = _lock_path(config)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
+        # Recompute launch capacity under the dispatch lock so concurrent
+        # dispatchers do not race on a stale running-task count.
+        available_slots = max_parallel_jobs - len(running_tasks(config))
+        if args.max_launch is not None:
+            available_slots = min(available_slots, max(0, args.max_launch))
+
         runnable = runnable_pending_tasks(config, graph_id=args.graph_id)
+        held_graphs = held_graph_ids(config)
+        if held_graphs:
+            runnable = [task for task in runnable if task["graph_id"] not in held_graphs]
+        if args.exclude_graph_id:
+            runnable = [task for task in runnable if task["graph_id"] != args.exclude_graph_id]
         if available_slots <= 0 or not runnable:
             print(f"[dispatch] launched=0 available_slots={available_slots} runnable={len(runnable)}", flush=True)
             return

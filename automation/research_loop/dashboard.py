@@ -85,6 +85,7 @@ def _job_record(task: dict) -> dict:
         "task_id": task["task_id"],
         "queue": queue_status,
         "status": derived_status,
+        "failure_reason": (job_status or {}).get("failure_reason"),
         "graph_id": task["graph_id"],
         "task_group_id": task["task_group_id"],
         "task_group_title": task["task_group_title"],
@@ -115,6 +116,7 @@ def _job_record(task: dict) -> dict:
         "has_stderr": bool(job_dir and (job_dir / "codex_stderr.txt").exists()),
         "has_analysis": bool(job_dir and (job_dir / "analysis.json").exists()),
         "has_heartbeat": bool(job_dir and (job_dir / "heartbeat.json").exists()),
+        "has_review_notify": bool(job_dir and (job_dir / "review_notify.json").exists()),
         "job_dir": str(job_dir) if job_dir else None,
         "sort_ts": _task_sort_timestamp(task),
     }
@@ -218,6 +220,7 @@ def _artifact_path(config: dict, task_id: str, kind: str) -> Path | None:
         "status": "job_status.json",
         "heartbeat": "heartbeat.json",
         "review": "review_status.json",
+        "review_notify": "review_notify.json",
     }
     filename = path_map.get(kind)
     if filename is None:

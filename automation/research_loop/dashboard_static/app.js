@@ -110,6 +110,9 @@ function renderJobItem(job) {
   card.append(el("p", "", job.summary || job.objective));
   card.append(el("p", "", `reasoning ${job.reasoning_effort} | timeout ${job.timeout_minutes}m | priority ${job.priority}`));
   card.append(el("p", "", `started ${job.started_at_utc || "unknown"} | finished ${job.finished_at_utc || "—"} | elapsed ${job.elapsed_minutes ?? "—"}m`));
+  if (job.failure_reason) {
+    card.append(el("p", "", `failure reason ${job.failure_reason}`));
+  }
   if (job.decision) {
     card.append(el("p", "", `decision ${job.decision}${job.delta !== null && job.delta !== undefined ? ` | delta ${job.delta}` : ""}`));
   }
@@ -119,12 +122,14 @@ function renderJobItem(job) {
   if (pills.children.length) card.append(pills);
 
   const actions = el("div", "job-actions");
-  ["stdout", "stderr", "analysis", "task", "status", "heartbeat"].forEach((kind) => {
+  ["stdout", "stderr", "analysis", "task", "status", "heartbeat", "review", "review_notify"].forEach((kind) => {
     const button = el("button", "button muted", kind);
     button.disabled = (kind === "stdout" && !job.has_stdout)
       || (kind === "stderr" && !job.has_stderr)
       || (kind === "analysis" && !job.has_analysis)
-      || (kind === "heartbeat" && !job.has_heartbeat);
+      || (kind === "heartbeat" && !job.has_heartbeat)
+      || (kind === "review" && !job.review_status)
+      || (kind === "review_notify" && !job.has_review_notify);
     button.addEventListener("click", () => showArtifact(job.task_id, kind));
     actions.append(button);
   });
@@ -168,11 +173,13 @@ async function refresh() {
     ["Latest cycle", payload.loop.latest_cycle ? `cycle ${payload.loop.latest_cycle.cycle}` : "—"],
   ]);
   renderMeta("sessionMeta", [
+    ["Reviewer", payload.session.provider || "—"],
     ["Session ID", payload.session.session_id || "—"],
     ["Mode", payload.session.mode || "—"],
     ["Status", payload.session.status || "—"],
     ["Current cycle", payload.session.current_cycle ?? "—"],
     ["Dispatched", payload.session.dispatched_at_utc || "—"],
+    ["Last handoff", payload.planner_handoff.trigger ? `${payload.planner_handoff.trigger} @ ${payload.planner_handoff.generated_at_utc}` : "—"],
   ]);
 
   document.getElementById("graphCount").textContent = String(payload.graphs.length);

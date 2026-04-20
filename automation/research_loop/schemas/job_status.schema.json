@@ -31,6 +31,12 @@
     "log_path": {
       "type": ["string", "null"]
     },
+    "stderr_path": {
+      "type": ["string", "null"]
+    },
+    "failure_reason": {
+      "type": ["string", "null"]
+    },
     "started_at_utc": {
       "type": "string"
     },

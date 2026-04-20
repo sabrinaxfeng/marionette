@@ -16,6 +16,9 @@ from lib.research_loop import (
     load_config,
     queue_task_counts,
     runnable_pending_tasks,
+    supervisor_heartbeat_path,
+    supervisor_is_healthy,
+    supervisor_pid_path,
     task_group_summaries,
     running_tasks,
 )
@@ -26,6 +29,19 @@ config = load_config(config_path, repo_root)
 
 print("=== Research Loop Status ===\n")
 
+supervisor_ok = supervisor_is_healthy(config)
+heartbeat_path = supervisor_heartbeat_path(config)
+pid_path = supervisor_pid_path(config)
+print(f"SUPERVISOR: {'healthy' if supervisor_ok else 'unavailable'}")
+print(f"  heartbeat: {heartbeat_path}")
+print(f"  pid file: {pid_path}")
+if heartbeat_path.exists():
+    heartbeat = json.loads(heartbeat_path.read_text(encoding='utf-8'))
+    print(f"  state: {heartbeat.get('state', 'unknown')}")
+    print(f"  pid: {heartbeat.get('pid', 'unknown')}")
+    print(f"  last_event: {heartbeat.get('last_event', 'unknown')}")
+print("")
+
 for task in running_tasks(config):
     task_path = Path(task["_path"])
     job_dir = task_path.parent
@@ -35,7 +51,7 @@ for task in running_tasks(config):
     if heartbeat_path.exists():
         heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
         print(f"  elapsed: {heartbeat['elapsed_minutes']}m / {heartbeat['timeout_minutes']}m")
-        print(f"  pid: {heartbeat['pid']}, subagents: {heartbeat['subagent_count']}")
+        print(f"  pid: {heartbeat['pid']}, pgid: {heartbeat.get('pgid', '—')}, subagents: {heartbeat['subagent_count']}")
         print(f"  reasoning effort: {heartbeat.get('reasoning_effort', 'unknown')}")
         print(f"  last heartbeat: {heartbeat['last_heartbeat_utc']}")
     elif status_path.exists():

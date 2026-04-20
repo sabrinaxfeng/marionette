@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import shutil
 from datetime import datetime, timezone
@@ -41,6 +42,8 @@ def load_config(path: Path, root: Path) -> dict[str, Any]:
         "current_cycle_markdown": "CURRENT_CYCLE.md",
         "state_json": "results/research_loop/state.json",
         "cycles_dir": "results/research_loop/cycles",
+        "reviewer_events_dir": "results/research_loop/reviewer_events",
+        "supervisor_heartbeat_json": "results/research_loop/supervisor/heartbeat.json",
     }
     reviewer_defaults = {
         "provider": "claude",
@@ -600,11 +603,98 @@ def complete_job(config: dict[str, Any], job_dir: Path, target: str = "completed
     return dest
 
 
+def _rewrite_bundle_path_string(value: Any, *, old_root: Path, new_root: Path) -> Any:
+    if not isinstance(value, str):
+        return value
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return value
+    try:
+        suffix = candidate.relative_to(old_root.resolve())
+    except ValueError:
+        return value
+    return str(new_root.resolve() / suffix)
+
+
+def _rewrite_bundle_payload(value: Any, *, old_root: Path, new_root: Path) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_bundle_payload(item, old_root=old_root, new_root=new_root)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_rewrite_bundle_payload(item, old_root=old_root, new_root=new_root) for item in value]
+    return _rewrite_bundle_path_string(value, old_root=old_root, new_root=new_root)
+
+
+def relocate_job_bundle_metadata(
+    previous_job_dir: Path,
+    job_dir: Path,
+    *,
+    target_status: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    """Rewrite job-bundle metadata after moving a job directory to another queue."""
+    for filename in ("job_status.json", "heartbeat.json", "review_status.json", "analysis.json", "review_notify.json"):
+        artifact = job_dir / filename
+        if not artifact.exists():
+            continue
+        payload = _rewrite_bundle_payload(load_json(artifact), old_root=previous_job_dir, new_root=job_dir)
+        if filename == "job_status.json":
+            if target_status is not None:
+                payload["status"] = target_status
+            if failure_reason is not None:
+                payload["failure_reason"] = failure_reason
+        save_json(artifact, payload)
+
+
 # --- Session bridge ---
 
 
 def loop_root(config: dict[str, Any]) -> Path:
     return Path(config["paths"]["cycles_dir"]).parent
+
+
+def reviewer_events_dir(config: dict[str, Any]) -> Path:
+    raw = config.get("paths", {}).get("reviewer_events_dir")
+    if raw:
+        return Path(raw)
+    return loop_root(config) / "reviewer_events"
+
+
+def reviewer_task_events_dir(config: dict[str, Any], task_id: str) -> Path:
+    return reviewer_events_dir(config) / "tasks" / task_id
+
+
+def reviewer_latest_event_path(config: dict[str, Any]) -> Path:
+    return reviewer_events_dir(config) / "latest_event.json"
+
+
+def supervisor_heartbeat_path(config: dict[str, Any]) -> Path:
+    raw = config.get("paths", {}).get("supervisor_heartbeat_json")
+    if raw:
+        return Path(raw)
+    return loop_root(config) / "supervisor" / "heartbeat.json"
+
+
+def supervisor_dir(config: dict[str, Any]) -> Path:
+    return supervisor_heartbeat_path(config).parent
+
+
+def supervisor_lock_path(config: dict[str, Any]) -> Path:
+    return supervisor_dir(config) / "supervisor.lock"
+
+
+def supervisor_pid_path(config: dict[str, Any]) -> Path:
+    return supervisor_dir(config) / "supervisor.pid"
+
+
+def graph_holds_path(config: dict[str, Any]) -> Path:
+    return supervisor_dir(config) / "graph_holds.json"
+
+
+def queue_nudge_path(config: dict[str, Any]) -> Path:
+    return queue_dirs(config)["pending"] / ".nudge"
 
 
 def completion_marker_path(config: dict[str, Any]) -> Path:
@@ -647,6 +737,195 @@ def load_session(config: dict[str, Any]) -> dict[str, Any] | None:
 def save_session(config: dict[str, Any], session: dict[str, Any]) -> None:
     """Write reviewer_session.json with normalized provider metadata."""
     save_json(_session_path(config), _normalize_session(config, session))
+
+
+def supervisor_is_healthy(config: dict[str, Any], *, max_age_seconds: int = 90) -> bool:
+    path = supervisor_heartbeat_path(config)
+    try:
+        if (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) > max_age_seconds:
+            return False
+        payload = load_json(path)
+        pid = int(payload.get("pid") or 0)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def touch_queue_nudge(config: dict[str, Any], *, reason: str) -> Path:
+    path = queue_nudge_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{utc_now_iso()} {reason}\n", encoding="utf-8")
+    return path
+
+
+def load_graph_holds(config: dict[str, Any]) -> dict[str, Any]:
+    path = graph_holds_path(config)
+    if not path.exists():
+        return {}
+    try:
+        payload = load_json(path)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def set_graph_hold(config: dict[str, Any], graph_id: str, *, reason: str, job_id: str | None = None) -> Path:
+    payload = load_graph_holds(config)
+    payload[graph_id] = {
+        "graph_id": graph_id,
+        "reason": reason,
+        "job_id": job_id,
+        "held_at_utc": utc_now_iso(),
+    }
+    path = graph_holds_path(config)
+    save_json(path, payload)
+    return path
+
+
+def clear_graph_hold(config: dict[str, Any], graph_id: str) -> Path:
+    payload = load_graph_holds(config)
+    payload.pop(graph_id, None)
+    path = graph_holds_path(config)
+    save_json(path, payload)
+    return path
+
+
+def held_graph_ids(config: dict[str, Any]) -> set[str]:
+    return set(load_graph_holds(config).keys())
+
+
+def emit_reviewer_event(
+    config: dict[str, Any],
+    *,
+    trigger: str,
+    message: str,
+    job_dir: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    events_dir = reviewer_events_dir(config)
+    events_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = job_dir.name if job_dir is not None else "loop"
+    event_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    base_name = f"{event_ts}__{trigger}__{job_id}"
+    event_dir = events_dir / base_name
+    suffix = 1
+    while event_dir.exists():
+        event_dir = events_dir / f"{base_name}__{suffix}"
+        suffix += 1
+    event_dir.mkdir(parents=True, exist_ok=True)
+
+    copied: dict[str, str] = {}
+    source_paths: dict[str, str] = {}
+    queue_name = None
+    task_meta: dict[str, Any] = {}
+    task_latest_event: str | None = None
+    task_events_dir_path: str | None = None
+
+    if job_dir is not None and job_dir.exists():
+        for name in (
+            "task.json",
+            "analysis.json",
+            "job_status.json",
+            "review_status.json",
+            "review_notify.json",
+            "heartbeat.json",
+        ):
+            source = job_dir / name
+            if not source.exists():
+                continue
+            dest = event_dir / name
+            shutil.copy2(source, dest)
+            copied[name] = str(dest)
+            source_paths[name] = str(source)
+        task_path = job_dir / "task.json"
+        if task_path.exists():
+            task = normalize_task(load_json(task_path))
+            task_meta = {
+                "task_id": task["task_id"],
+                "graph_id": task["graph_id"],
+                "task_group_id": task["task_group_id"],
+                "objective": task["objective"],
+            }
+            task_id = task["task_id"]
+            located = locate_task(config, task_id)
+            if located is not None:
+                queue_name = located[0]
+
+    handoff_source = planner_handoff_path(config)
+    if handoff_source.exists():
+        dest = event_dir / "planner_handoff.json"
+        shutil.copy2(handoff_source, dest)
+        copied["planner_handoff.json"] = str(dest)
+        source_paths["planner_handoff.json"] = str(handoff_source)
+
+    marker_source = completion_marker_path(config)
+    if marker_source.exists():
+        dest = event_dir / "loop_completion.txt"
+        shutil.copy2(marker_source, dest)
+        copied["loop_completion.txt"] = str(dest)
+        source_paths["loop_completion.txt"] = str(marker_source)
+
+    (event_dir / "message.txt").write_text(message + "\n", encoding="utf-8")
+    copied["message.txt"] = str(event_dir / "message.txt")
+
+    event_payload = {
+        "event_id": event_dir.name,
+        "generated_at_utc": utc_now_iso(),
+        "trigger": trigger,
+        "message": message,
+        "job_id": job_id if job_dir is not None else None,
+        "job_dir": str(job_dir) if job_dir is not None else None,
+        "queue": queue_name,
+        "task": task_meta or None,
+        "copied_artifacts": copied,
+        "source_artifacts": source_paths,
+        "extra": extra or {},
+    }
+    event_json = event_dir / "event.json"
+    save_json(event_json, event_payload)
+    save_json(
+        reviewer_latest_event_path(config),
+        {
+            "event_id": event_payload["event_id"],
+            "event_json": str(event_json),
+            "generated_at_utc": event_payload["generated_at_utc"],
+            "trigger": trigger,
+            "job_id": event_payload["job_id"],
+            "message": message,
+        },
+    )
+    task_id = str((task_meta or {}).get("task_id") or "")
+    if task_id:
+        task_events_dir = reviewer_task_events_dir(config, task_id)
+        task_events_dir.mkdir(parents=True, exist_ok=True)
+        task_latest = task_events_dir / "latest_event.json"
+        save_json(
+            task_latest,
+            {
+                "event_id": event_payload["event_id"],
+                "event_json": str(event_json),
+                "generated_at_utc": event_payload["generated_at_utc"],
+                "trigger": trigger,
+                "job_id": event_payload["job_id"],
+                "task_id": task_id,
+                "message": message,
+            },
+        )
+        task_latest_event = str(task_latest)
+        task_events_dir_path = str(task_events_dir)
+    return {
+        "event_dir": str(event_dir),
+        "event_json": str(event_json),
+        "latest_event": str(reviewer_latest_event_path(config)),
+        "task_events_dir": task_events_dir_path,
+        "task_latest_event": task_latest_event,
+    }
 
 
 def queue_task_counts(config: dict[str, Any]) -> dict[str, int]:
@@ -726,11 +1005,20 @@ def write_planner_handoff(config: dict[str, Any], *, trigger: str, message: str)
     return path
 
 
-def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeout_s: int = 120) -> dict[str, Any]:
+def notify_reviewer(
+    config: dict[str, Any],
+    message: str,
+    *,
+    trigger: str,
+    timeout_s: int = 120,
+    job_dir: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     marker_path = completion_marker_path(config)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.write_text(message + "\n", encoding="utf-8")
     handoff_path = write_planner_handoff(config, trigger=trigger, message=message)
+    reviewer_event = emit_reviewer_event(config, trigger=trigger, message=message, job_dir=job_dir, extra=extra)
 
     session = load_session(config)
     if not session:
@@ -740,6 +1028,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
             "session_id": None,
             "completion_marker": str(marker_path),
             "planner_handoff": str(handoff_path),
+            "reviewer_event": reviewer_event["event_json"],
+            "reviewer_event_dir": reviewer_event["event_dir"],
+            "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+            "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
         }
 
     mode = str(session.get("mode") or "")
@@ -752,6 +1044,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
             "session_id": session_id or None,
             "completion_marker": str(marker_path),
             "planner_handoff": str(handoff_path),
+            "reviewer_event": reviewer_event["event_json"],
+            "reviewer_event_dir": reviewer_event["event_dir"],
+            "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+            "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
         }
 
     if not session_id:
@@ -761,6 +1057,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
             "session_id": None,
             "completion_marker": str(marker_path),
             "planner_handoff": str(handoff_path),
+            "reviewer_event": reviewer_event["event_json"],
+            "reviewer_event_dir": reviewer_event["event_dir"],
+            "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+            "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
         }
 
     if provider == "claude":
@@ -774,6 +1074,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
             "session_id": session_id,
             "completion_marker": str(marker_path),
             "planner_handoff": str(handoff_path),
+            "reviewer_event": reviewer_event["event_json"],
+            "reviewer_event_dir": reviewer_event["event_dir"],
+            "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+            "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
         }
 
     try:
@@ -789,6 +1093,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
             "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else "",
             "completion_marker": str(marker_path),
             "planner_handoff": str(handoff_path),
+            "reviewer_event": reviewer_event["event_json"],
+            "reviewer_event_dir": reviewer_event["event_dir"],
+            "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+            "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
         }
     except OSError as exc:
         return {
@@ -799,6 +1107,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
             "error": str(exc),
             "completion_marker": str(marker_path),
             "planner_handoff": str(handoff_path),
+            "reviewer_event": reviewer_event["event_json"],
+            "reviewer_event_dir": reviewer_event["event_dir"],
+            "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+            "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
         }
     return {
         "status": "resumed" if cp.returncode == 0 else "resume_failed",
@@ -810,6 +1122,10 @@ def notify_reviewer(config: dict[str, Any], message: str, *, trigger: str, timeo
         "stderr": cp.stderr.strip(),
         "completion_marker": str(marker_path),
         "planner_handoff": str(handoff_path),
+        "reviewer_event": reviewer_event["event_json"],
+        "reviewer_event_dir": reviewer_event["event_dir"],
+        "reviewer_task_events_dir": reviewer_event.get("task_events_dir"),
+        "reviewer_task_latest_event": reviewer_event.get("task_latest_event"),
     }
 
 

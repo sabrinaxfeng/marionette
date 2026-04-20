@@ -124,36 +124,53 @@ def _load_default_reasoning_effort() -> str:
     return str(config.get("codex", {}).get("reasoning_effort") or "medium")
 
 
-def _kill_gracefully(pid: int, grace: int = 10) -> None:
+def _signal_process_group(pgid: int, sig: int) -> bool:
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.killpg(pgid, sig)
+        return True
     except OSError:
+        return False
+
+
+def _kill_gracefully(pgid: int, grace: int = 10) -> None:
+    if not _signal_process_group(pgid, signal.SIGTERM):
         return
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         try:
-            os.kill(pid, 0)
+            os.killpg(pgid, 0)
         except OSError:
             return
         time.sleep(0.5)
+    _signal_process_group(pgid, signal.SIGKILL)
+
+
+def _process_group_subagent_count(*, leader_pid: int, pgid: int) -> int:
     try:
-        os.kill(pid, signal.SIGKILL)
+        cp = subprocess.run(["pgrep", "-g", str(pgid)], capture_output=True, text=True, check=False)
     except OSError:
-        pass
+        return 0
+    pids = {
+        int(line.strip())
+        for line in cp.stdout.splitlines()
+        if line.strip().isdigit()
+    }
+    pids.discard(leader_pid)
+    return len(pids)
 
 
 REVIEW_SIGNAL = "REVIEW_REQUESTED.json"
 
 
-def _check_review_signal(job_dir: Path, pid: int, task_id: str, config: dict) -> None:
+def _check_review_signal(job_dir: Path, pgid: int, task_id: str, config: dict) -> str | None:
     """Check if the analyst dropped a review signal. Handle by type."""
     signal_path = job_dir / REVIEW_SIGNAL
     if not signal_path.exists():
-        return
+        return None
     try:
         sig = json.loads(signal_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return
+        return None
 
     reason = sig.get("reason", "checkpoint")
     message = sig.get("message", "")
@@ -162,22 +179,24 @@ def _check_review_signal(job_dir: Path, pid: int, task_id: str, config: dict) ->
     if reason == "progress":
         # Informational only — rename so we don't re-trigger, keep running
         signal_path.rename(job_dir / f"review_progress_{_utc_now_iso().replace(':', '-')}.json")
-        return
+        return None
 
     # checkpoint or blocked — pause analyst, notify reviewer, then decide
     try:
-        os.kill(pid, signal.SIGSTOP)
+        _signal_process_group(pgid, signal.SIGSTOP)
     except OSError:
         pass
 
-    _write_json(job_dir / "review_status.json", {
+    review_status_path = job_dir / "review_status.json"
+    review_status = {
         "job_id": task_id,
         "review_type": reason,
         "message": message,
         "artifacts": sig.get("artifacts", []),
         "stage": sig.get("stage", "unknown"),
         "paused_at_utc": _utc_now_iso(),
-    })
+    }
+    _write_json(review_status_path, review_status)
 
     try:
         review_payload = json.dumps(sig, indent=2)
@@ -190,7 +209,17 @@ def _check_review_signal(job_dir: Path, pid: int, task_id: str, config: dict) ->
             '{"action": "continue"} or {"action": "abort"} to let the watcher decide next steps.\n\n'
             f"Signal payload:\n{review_payload}"
         )
-        notify_result = notify_reviewer(config, review_message, trigger=f"review_{reason}")
+        notify_result = notify_reviewer(
+            config,
+            review_message,
+            trigger=f"review_{reason}",
+            job_dir=job_dir,
+            extra={
+                "reason": reason,
+                "stage": sig.get("stage", "unknown"),
+                "artifacts": sig.get("artifacts", []),
+            },
+        )
         _write_json(job_dir / "review_notify.json", notify_result)
         print(
             f"[watcher] {task_id}: reviewer notify status={notify_result.get('status')} "
@@ -215,23 +244,31 @@ def _check_review_signal(job_dir: Path, pid: int, task_id: str, config: dict) ->
             print(f"[watcher] {task_id}: review response: {action}", flush=True)
             signal_path.unlink(missing_ok=True)
             response_path.unlink(missing_ok=True)
+            review_status["review_action"] = action
+            review_status["review_response"] = resp
+            review_status["reviewed_at_utc"] = _utc_now_iso()
+            _write_json(review_status_path, review_status)
             if action == "abort":
-                _kill_gracefully(pid)
-                return
+                _kill_gracefully(pgid)
+                return "abort"
             try:
-                os.kill(pid, signal.SIGCONT)
+                _signal_process_group(pgid, signal.SIGCONT)
             except OSError:
                 pass
-            return
+            return action
         time.sleep(5)
 
     # Review timed out — resume and continue
     print(f"[watcher] {task_id}: review timed out, resuming", flush=True)
     signal_path.unlink(missing_ok=True)
+    review_status["review_action"] = "timeout_resume"
+    review_status["reviewed_at_utc"] = _utc_now_iso()
+    _write_json(review_status_path, review_status)
     try:
-        os.kill(pid, signal.SIGCONT)
+        _signal_process_group(pgid, signal.SIGCONT)
     except OSError:
         pass
+    return "timeout_resume"
 
 
 def main() -> None:
@@ -281,13 +318,16 @@ def main() -> None:
             stdout=fout,
             stderr=ferr,
             cwd=ROOT,
+            start_new_session=True,
         )
         proc.stdin.write(prompt.encode())
         proc.stdin.close()
 
     pid = proc.pid
+    pgid = proc.pid
     timeout_s = args.timeout * 60
     status = "completed"
+    failure_reason = None
     heartbeat_path = job_dir / "heartbeat.json"
 
     while proc.poll() is None:
@@ -295,17 +335,12 @@ def main() -> None:
         elapsed = time.monotonic() - t0
 
         # Write heartbeat so external tools can see we're alive
-        subagent_count = 0
-        try:
-            import subprocess as _sp
-            ps_out = _sp.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
-            subagent_count = len(ps_out.stdout.strip().splitlines()) if ps_out.stdout.strip() else 0
-        except Exception:
-            pass
+        subagent_count = _process_group_subagent_count(leader_pid=pid, pgid=pgid)
         _write_json(heartbeat_path, {
             "job_id": task_id,
             "status": "running",
             "pid": pid,
+            "pgid": pgid,
             "elapsed_minutes": round(elapsed / 60, 1),
             "timeout_minutes": args.timeout,
             "reasoning_effort": reasoning_effort,
@@ -315,28 +350,38 @@ def main() -> None:
 
         if elapsed > timeout_s:
             status = "timed_out"
-            _kill_gracefully(pid)
+            failure_reason = "watcher_timeout"
+            _kill_gracefully(pgid)
             break
 
-        _check_review_signal(job_dir, pid, task_id, config)
+        review_action = _check_review_signal(job_dir, pgid, task_id, config)
+        if review_action == "abort":
+            status = "failed"
+            failure_reason = "review_abort"
+            break
 
     exit_code = proc.wait()
     if status == "completed" and exit_code != 0:
         status = "failed"
+        failure_reason = failure_reason or "process_exit_nonzero"
 
     duration = time.monotonic() - t0
     finished_at = _utc_now_iso()
 
-    _write_json(status_path, {
+    job_status = {
         "job_id": task_id,
         "status": status,
         "exit_code": exit_code,
         "duration_seconds": round(duration, 1),
         "output_path": str(result_path) if result_path.exists() else None,
         "log_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
         "started_at_utc": started_at,
         "finished_at_utc": finished_at,
-    })
+    }
+    if failure_reason is not None:
+        job_status["failure_reason"] = failure_reason
+    _write_json(status_path, job_status)
 
     print(f"[watcher] {task_id}: {status} (exit={exit_code}, {duration:.0f}s)", flush=True)
     sys.exit(0 if status == "completed" else 1)

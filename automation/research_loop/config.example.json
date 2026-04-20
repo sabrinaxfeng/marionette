@@ -26,6 +26,8 @@
   "paths": {
     "current_cycle_markdown": "CURRENT_CYCLE.md",
     "state_json": "results/research_loop/state.json",
-    "cycles_dir": "results/research_loop/cycles"
+    "cycles_dir": "results/research_loop/cycles",
+    "reviewer_events_dir": "results/research_loop/reviewer_events",
+    "supervisor_heartbeat_json": "results/research_loop/supervisor/heartbeat.json"
   }
 }
