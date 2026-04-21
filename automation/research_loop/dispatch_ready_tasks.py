@@ -85,14 +85,20 @@ def main() -> None:
 
         launched = 0
         for task in runnable[:available_slots]:
+            if args.dry_run:
+                launched += 1
+                print(
+                    f"[dispatch] dry-run would claim {task['task_id']} "
+                    f"graph={task['graph_id']} priority={task.get('priority', 0)}",
+                    flush=True,
+                )
+                continue
             try:
                 job_dir = claim_task(config, task["task_id"])
             except FileNotFoundError:
                 continue
             launched += 1
             print(f"[dispatch] claimed {task['task_id']} graph={task['graph_id']} priority={task.get('priority', 0)}", flush=True)
-            if args.dry_run:
-                continue
             _launch_chain(repo_root=ROOT, job_dir=job_dir, timeout_minutes=int(task["timeout_minutes"]))
 
         print(f"[dispatch] launched={launched} available_slots={available_slots} runnable={len(runnable)}", flush=True)

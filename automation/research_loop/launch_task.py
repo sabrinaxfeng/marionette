@@ -18,6 +18,7 @@ from lib.research_loop import (  # noqa: E402
     load_config,
     load_json,
     locate_task,
+    normalize_task,
     queue_dirs,
     reviewer_events_dir,
     reviewer_task_events_dir,
@@ -88,7 +89,7 @@ def main() -> None:
             sys.exit(1)
 
         if args.task_file is not None:
-            task = load_json(args.task_file.resolve())
+            task = normalize_task(load_json(args.task_file.resolve()))
             try:
                 pending_path = write_task(config, task)
                 clear_graph_hold(config, str(task["graph_id"]))

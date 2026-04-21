@@ -928,13 +928,6 @@ def emit_reviewer_event(
     }
 
 
-def queue_task_counts(config: dict[str, Any]) -> dict[str, int]:
-    return {
-        queue_name: len(load_tasks(config, queue_name))
-        for queue_name in ("pending", "running", "completed", "failed")
-    }
-
-
 def _latest_job_in_queue(config: dict[str, Any], queue_name: str) -> dict[str, Any] | None:
     tasks = load_tasks(config, queue_name)
     if not tasks:

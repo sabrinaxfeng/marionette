@@ -119,10 +119,9 @@ PY
 LAST_RENDERED_MTIME=""
 
 if [[ -f "$LATEST_EVENT_JSON" ]]; then
-    render_latest "$LATEST_EVENT_JSON"
     LAST_RENDERED_MTIME="$(latest_mtime "$LATEST_EVENT_JSON")"
-    if [[ "$ONCE" -eq 1 ]]; then
-        exit 0
+    if [[ "$ONCE" -eq 0 ]]; then
+        render_latest "$LATEST_EVENT_JSON"
     fi
 fi
 
